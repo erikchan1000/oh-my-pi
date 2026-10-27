@@ -2236,6 +2236,8 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
+	/** Branch the live parent session so the child inherits its context and prompt cache (requires `task.forkEnabled`). */
+	fork?: boolean;
 }
 
 /**
@@ -2271,6 +2273,8 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/** Branch the live parent session (flat form; per-item in batch form). */
+	fork?: boolean;
 }
 
 /**

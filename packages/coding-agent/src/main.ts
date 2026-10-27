@@ -10,7 +10,7 @@ import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core/thinking";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { getModelPricingStatus } from "@oh-my-pi/pi-catalog/models";
-import { isEnoent, isEnotdir } from "@oh-my-pi/pi-utils";
+import { isEnoent, isEnotdir, sanitizeText } from "@oh-my-pi/pi-utils";
 import {
 	APP_NAME,
 	directoryIsMissing,
@@ -785,7 +785,10 @@ async function runInteractiveMode(
 	if (startupRestore) {
 		try {
 			using _keepalive = new EventLoopKeepalive();
-			const { turn, subagents } = await startupRestore();
+			const { turn, subagents, unrestorable } = await startupRestore();
+			for (const { id, reason } of unrestorable) {
+				mode.showWarning(`Could not restore subagent ${id}: ${sanitizeText(reason)}`);
+			}
 			const agents = subagents.length === 1 ? "1 subagent" : `${subagents.length} subagents`;
 			mode.showStatus(
 				turn && subagents.length > 0

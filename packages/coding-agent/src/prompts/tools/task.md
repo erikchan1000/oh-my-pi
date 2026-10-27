@@ -23,7 +23,8 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
 {{/if}}{{#if structured}}`schemaMode`: default permissive warns after retries; strict fails.
 {{/if}}{{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
 {{else}}`isolated`: worktree; changes retained, not applied.
-{{/if}}{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
+{{/if}}{{/if}}{{#if forkEnabled}}Exception to the blank start: `fork`: child branches your live context and shares its prompt cache; refused when your context exceeds {{forkMaxParentTokens}} tokens; the agent role prompt and tool limits do not apply to it.
+{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
 
 # Format
 {{#if batchEnabled}}`context`: shared (`# Goal`, `# Contract` interfaces); NEVER repeat per task.

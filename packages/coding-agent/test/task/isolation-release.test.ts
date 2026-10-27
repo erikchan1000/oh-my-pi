@@ -105,6 +105,7 @@ async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatc
 		preferredBackend: undefined,
 		agentId: id,
 		mergeMode: "branch",
+		applyChanges: true,
 		artifactsDir,
 		buildFailureResult: error => ({ ...result(id), exitCode: 1, error: String(error) }),
 	});
@@ -126,5 +127,65 @@ describe("isolated agent release", () => {
 	it("lets held peer messages wake the agent only after the run-end branch is committed", async () => {
 		await commitsAcrossRelease("ReleaseAfterCapture", patch, patch);
 		expect(events).toEqual(["commit", "irc wakes released"]);
+	});
+
+	it("still marks a successful live patch-mode run isolated, records its artifacts and drops the sidecar after cleanup", async () => {
+		const id = "LivePatch";
+		const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-live-"));
+		tempRoots.push(artifactsDir);
+		const baseline = {
+			root: { repoRoot: "/repo", headCommit: "base", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
+			nested: [],
+		};
+		vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
+			mergedDir: "/repo/isolated",
+			backend: natives.IsoBackendKind.Rcopy,
+			fellBack: false,
+			fallbackReason: null,
+		});
+		vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(baseline);
+		vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "diff --git a/task.txt b/task.txt\n+work\n",
+			nestedPatches: [],
+		});
+		let sidecarDuringRun = false;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			AgentRegistry.global().register({
+				id: options.id,
+				displayName: options.id,
+				kind: "sub",
+				session: null,
+				sessionFile: `/tmp/${options.id}.jsonl`,
+				status: "parked",
+			});
+			sidecarDuringRun = await Bun.file(path.join(artifactsDir, `${id}.isolation.json`)).exists();
+			return result(options.id);
+		});
+
+		const outcome = await runIsolatedSubprocess({
+			baseOptions: {
+				cwd: "/repo",
+				agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
+				task: "Do work",
+				index: 0,
+				id,
+				keepAlive: false,
+			},
+			context: { repoRoot: "/repo" },
+			preferredBackend: undefined,
+			agentId: id,
+			mergeMode: "patch",
+			applyChanges: true,
+			artifactsDir,
+			buildFailureResult: error => ({ ...result(id), exitCode: 1, error: String(error) }),
+		});
+
+		expect(outcome.isolated).toBe(true);
+		expect(outcome.patchPath).toBe(path.join(artifactsDir, `${id}.patch`));
+		expect(AgentRegistry.global().get(id)?.history?.patchPath).toBe(outcome.patchPath);
+		expect(sidecarDuringRun).toBe(true);
+		expect(await Bun.file(path.join(artifactsDir, `${id}.isolation.json`)).exists()).toBe(false);
+		AgentRegistry.global().unregister(id);
 	});
 });

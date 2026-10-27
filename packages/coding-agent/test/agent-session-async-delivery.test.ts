@@ -12,18 +12,23 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
-import type { AsyncJob } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import type { AsyncJob, AsyncJobType } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type {
+	AsyncResultEvent,
+	AsyncResultEventResult,
+	ExtensionAPI,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { buildAsyncResultBlock } from "@oh-my-pi/pi-tui/chat/transcript-render-helpers";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import {
+	ASYNC_INLINE_RESULT_MAX_CHARS,
 	buildAsyncResultBatchMessage,
 	type AsyncResultDetails,
 	type AsyncResultEntry,
@@ -1041,6 +1046,344 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		return { manager, mock, targetSessionFile };
 	}
+
+	describe("async_result extension event", () => {
+		type AsyncResultHandler = (
+			event: AsyncResultEvent,
+		) => AsyncResultEventResult | undefined | Promise<AsyncResultEventResult | undefined>;
+
+		function deliverTask(handler: AsyncResultHandler | undefined, body: () => Promise<string>): Promise<string> {
+			return deliverJob({ handlers: handler ? [handler] : [], jobType: "task", body });
+		}
+
+		/** Each handler is loaded as its own extension, in array order. */
+		async function deliverJob(opts: {
+			handlers: AsyncResultHandler[];
+			jobType: AsyncJobType;
+			body: Parameters<AsyncJobManager["register"]>[2];
+			/** Filled with the enqueued entries and extension errors when given. */
+			capture?: { entries: AsyncResultEntry[]; errors: string[] };
+			/**
+			 * Suppresses the job's delivery once `dropped` flips true. With
+			 * `duringFormat`, it flips inside the follow-up formatter's artifact
+			 * spill (the body must exceed the inline cap), i.e. after the sink's
+			 * entry guard; otherwise a handler flips it itself.
+			 */
+			drop?: { dropped: boolean; duringFormat?: boolean };
+		}): Promise<string> {
+			await using tempDir = await TempDir.create("@async-result-event-");
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+			const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				convertToLlm,
+				streamFn: mock.stream,
+			});
+			const authStorage = await AuthStorage.create(":memory:");
+			authStorages.push(authStorage);
+			authStorage.keys.setRuntime("anthropic", "test-key");
+			const manager = new AsyncJobManager({});
+			AsyncJobManager.setInstance(manager);
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const modelRegistry = new ModelRegistry(authStorage);
+			const runtime = new ExtensionRuntime();
+			const extensions = [];
+			for (const [index, handler] of (opts.handlers.length > 0 ? opts.handlers : [undefined]).entries()) {
+				extensions.push(
+					await loadExtensionFromFactory(
+						api => {
+							if (handler) api.on("async_result", event => handler(event));
+						},
+						tempDir.path(),
+						new EventBus(),
+						runtime,
+						`async-result-test-extension-${index}`,
+					),
+				);
+			}
+			const extensionRunner = new ExtensionRunner(
+				extensions,
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			session = new AgentSession({
+				agent,
+				sessionManager,
+				settings: Settings.isolated(),
+				modelRegistry,
+				agentId: "Main",
+				ownedAsyncJobManager: manager,
+				extensionRunner,
+			});
+			const entries: AsyncResultEntry[] = opts.capture?.entries ?? [];
+			extensionRunner.onError(error => opts.capture?.errors.push(String(error.error)));
+			const drop = opts.drop;
+			if (drop) {
+				const isSuppressed = manager.isDeliverySuppressed.bind(manager);
+				vi.spyOn(manager, "isDeliverySuppressed").mockImplementation(
+					jobId => (drop.dropped && jobId === "job-3") || isSuppressed(jobId),
+				);
+				if (drop.duringFormat) {
+					const allocate = sessionManager.allocateArtifactPath.bind(sessionManager);
+					vi.spyOn(sessionManager, "allocateArtifactPath").mockImplementation(async (...args) => {
+						drop.dropped = true;
+						return allocate(...args);
+					});
+				}
+			}
+			const enqueue = session.yieldQueue.enqueueWithReceipt.bind(session.yieldQueue);
+			vi.spyOn(session.yieldQueue, "enqueueWithReceipt").mockImplementation((kind, entry) => {
+				if (kind === "async-result") entries.push(entry as AsyncResultEntry);
+				return enqueue(kind, entry);
+			});
+			if (opts.jobType === "task") {
+				manager.register("task", "child", opts.body, { id: "job-3", ownerId: "Main", agentId: "Child-3" });
+			} else {
+				manager.register(opts.jobType, "cmd", opts.body, { id: "job-3", ownerId: "Main" });
+			}
+			await session.settleAsyncWork();
+			if (drop) return "";
+			expect(entries).toHaveLength(1);
+			return entries[0].result;
+		}
+
+		const pixel: ImageContent = {
+			type: "image",
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+		};
+
+		async function deliveredImageCount(handlers: AsyncResultHandler[]): Promise<number> {
+			const capture = { entries: [] as AsyncResultEntry[], errors: [] as string[] };
+			await deliverJob({
+				handlers,
+				jobType: "task",
+				capture,
+				body: async ({ reportProgress }) => {
+					await reportProgress("body", { images: [pixel] });
+					return "body";
+				},
+			});
+			const message = buildAsyncResultBatchMessage(capture.entries);
+			if (!message || typeof message.content === "string") return 0;
+			return message.content.filter(part => part.type === "image").length;
+		}
+
+		it("attaches the job's images only when no handler rewrote the body", async () => {
+			expect(await deliveredImageCount([])).toBe(1);
+			expect(await deliveredImageCount([() => ({ text: "digest" })])).toBe(0);
+			expect(await deliveredImageCount([() => ({ suppress: true })])).toBe(0);
+			// Observers and failing handlers leave the raw body, and so its images, in place.
+			expect(await deliveredImageCount([() => undefined])).toBe(1);
+			expect(await deliveredImageCount([() => ({})])).toBe(1);
+			expect(
+				await deliveredImageCount([
+					() => {
+						throw new Error("handler exploded");
+					},
+				]),
+			).toBe(1);
+		});
+
+		it("keeps the previous text and reports the error when a handler throws", async () => {
+			const alone = { entries: [] as AsyncResultEntry[], errors: [] as string[] };
+			await deliverJob({
+				handlers: [
+					() => {
+						throw new Error("handler exploded");
+					},
+				],
+				jobType: "task",
+				body: async () => "original body",
+				capture: alone,
+			});
+			expect(alone.entries[0].result).toContain("original body");
+			expect(alone.entries[0].result).not.toContain("agent://");
+			expect(alone.errors.some(error => error.includes("handler exploded"))).toBe(true);
+			// A throw is not a rewrite: the raw body stands, so its images must still attach.
+			expect(alone.entries[0].rewritten).toBe(false);
+
+			const chained = { entries: [] as AsyncResultEntry[], errors: [] as string[] };
+			await deliverJob({
+				handlers: [
+					() => ({ text: "digest" }),
+					() => {
+						throw new Error("second exploded");
+					},
+				],
+				jobType: "task",
+				body: async () => "original body",
+				capture: chained,
+			});
+			expect(chained.entries[0].result).toBe("[task job-3 completed] agent://Child-3\ndigest");
+			expect(chained.errors.some(error => error.includes("second exploded"))).toBe(true);
+			expect(chained.entries[0].rewritten).toBe(true);
+		});
+
+		it("never invokes handlers for a delivery dropped while formatting", async () => {
+			const handler = vi.fn(() => ({ text: "digest" }));
+			const capture = { entries: [] as AsyncResultEntry[], errors: [] as string[] };
+			const drop = { dropped: false, duringFormat: true };
+			await deliverJob({
+				handlers: [handler],
+				jobType: "task",
+				// Over the inline cap, so formatting spills to an artifact — the hook that flips the drop.
+				body: async () => "x".repeat(ASYNC_INLINE_RESULT_MAX_CHARS + 1),
+				capture,
+				drop,
+			});
+			// The drop really landed mid-format (the sink got past its entry guard), not in the manager's loop.
+			expect(drop.dropped).toBe(true);
+			expect(handler).not.toHaveBeenCalled();
+			expect(capture.entries).toHaveLength(0);
+		});
+
+		it("does not enqueue a delivery dropped while a handler runs", async () => {
+			const drop = { dropped: false };
+			const handler = vi.fn(() => {
+				drop.dropped = true;
+				return { text: "digest" };
+			});
+			const capture = { entries: [] as AsyncResultEntry[], errors: [] as string[] };
+			await deliverJob({
+				handlers: [handler],
+				jobType: "task",
+				body: async () => "original body",
+				capture,
+				drop,
+			});
+			expect(handler).toHaveBeenCalledTimes(1);
+			expect(capture.entries).toHaveLength(0);
+		});
+
+		it("replaces the body but keeps the core status line and agent:// pointer", async () => {
+			const result = await deliverTask(
+				() => ({ text: "digest" }),
+				async () => "very long original body",
+			);
+			expect(result).toBe("[task job-3 completed] agent://Child-3\ndigest");
+		});
+
+		it("delivers only the header when a handler suppresses", async () => {
+			const result = await deliverTask(
+				() => ({ suppress: true }),
+				async () => "original body",
+			);
+			expect(result).toBe("[task job-3 completed] agent://Child-3");
+		});
+
+		it("still reports a failed job's status when its result is suppressed", async () => {
+			const result = await deliverTask(
+				() => ({ suppress: true }),
+				async () => {
+					throw new Error("boom");
+				},
+			);
+			expect(result).toBe("[task job-3 failed] agent://Child-3");
+		});
+
+		it("leaves the formatted result untouched when no handler is registered", async () => {
+			const result = await deliverTask(undefined, async () => "original body");
+			expect(result).toContain("original body");
+			expect(result).not.toContain("agent://");
+		});
+
+		it("passes the formatted result and job identity to the handler", async () => {
+			const events: AsyncResultEvent[] = [];
+			await deliverTask(
+				event => {
+					events.push(event);
+					return undefined;
+				},
+				async () => "original body",
+			);
+			expect(events).toHaveLength(1);
+			expect(events[0]).toMatchObject({
+				type: "async_result",
+				jobId: "job-3",
+				jobType: "task",
+				agentId: "Child-3",
+				label: "child",
+				status: "completed",
+			});
+			expect(events[0].text).toContain("original body");
+		});
+
+		it("keeps delivery byte-identical when a handler only observes", async () => {
+			const baseline = await deliverTask(undefined, async () => "original body");
+			const observed = await deliverTask(
+				() => undefined,
+				async () => "original body",
+			);
+			const empty = await deliverTask(
+				() => ({}),
+				async () => "original body",
+			);
+			expect(observed).toBe(baseline);
+			expect(empty).toBe(baseline);
+		});
+
+		it("chains handlers so a later extension sees the earlier replacement", async () => {
+			const seen: string[] = [];
+			const result = await deliverJob({
+				jobType: "task",
+				body: async () => "original body",
+				handlers: [
+					event => {
+						seen.push(event.text);
+						return { text: "first digest" };
+					},
+					event => {
+						seen.push(event.text);
+						return { text: `${event.text} + second` };
+					},
+				],
+			});
+			expect(seen).toHaveLength(2);
+			expect(seen[0]).toContain("original body");
+			expect(seen[1]).toBe("first digest");
+			expect(result).toBe("[task job-3 completed] agent://Child-3\nfirst digest + second");
+		});
+
+		it("lets an earlier suppress win over a later handler's replacement text", async () => {
+			const result = await deliverJob({
+				jobType: "task",
+				body: async () => "original body",
+				handlers: [() => ({ suppress: true }), () => ({ text: "late digest" })],
+			});
+			expect(result).toBe("[task job-3 completed] agent://Child-3");
+		});
+
+		it("lets a later suppress win over an earlier handler's replacement text", async () => {
+			const result = await deliverJob({
+				jobType: "task",
+				body: async () => "original body",
+				handlers: [() => ({ text: "early digest" }), () => ({ suppress: true })],
+			});
+			expect(result).toBe("[task job-3 completed] agent://Child-3");
+		});
+
+		it("points a rewritten bash job at proc://", async () => {
+			const result = await deliverJob({
+				jobType: "bash",
+				body: async () => "bash output",
+				handlers: [() => ({ text: "digest" })],
+			});
+			expect(result).toBe("[bash job-3 completed] proc://job-3\ndigest");
+		});
+
+		it("points a suppressed eval job at proc://", async () => {
+			const result = await deliverJob({
+				jobType: "eval",
+				body: async () => "eval output",
+				handlers: [() => ({ suppress: true })],
+			});
+			expect(result).toBe("[eval job-3 completed] proc://job-3");
+		});
+	});
 
 	it("cancels the outgoing session's background jobs when resuming another session", async () => {
 		using tempDir = TempDir.createSync("@pi-resume-async-jobs-");

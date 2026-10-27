@@ -41,6 +41,20 @@ Nested repository patches (not applied):
 {{#list nestedPatchPaths prefix="- "}}{{this}}{{/list}}
 {{/if}}
 {{/when}}
+{{#when kind "==" "patch-conflict"}}
+<system-notification>Patch was not applied: it conflicts with changes already in the working tree. The working tree is unchanged.</system-notification>
+
+Paths in the unapplied patch:
+{{#list conflictPaths prefix="- "}}{{this}}{{/list}}
+{{#if rootPatchPath}}
+Patch artifact (resolve manually):
+- {{rootPatchPath}}
+{{/if}}
+{{#if nestedPatchPaths}}
+Nested repository patches (not applied):
+{{#list nestedPatchPaths prefix="- "}}{{this}}{{/list}}
+{{/if}}
+{{/when}}
 {{#when kind "==" "branch-merge-failed"}}
 <system-notification>Branch merge failed: {{branchName}}.
 {{#if conflict}}

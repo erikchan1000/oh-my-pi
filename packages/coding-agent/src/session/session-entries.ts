@@ -282,6 +282,10 @@ export interface SessionInitEntry extends SessionEntryBase {
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	/** Whether revival must retain only the explicitly persisted tool names. */
 	restrictToolNames?: boolean;
+	/** Forked-context task child: revival keeps the parent's depth-gated tools (`task`) and tool presentation. */
+	forkOfParent?: boolean;
+	/** xd://-mounted tool names of a fork child, restored so its provider tool shape matches the parent's. */
+	mountedToolNames?: string[];
 	/** Spawn allowlist the subagent ran with ("" = none, "*" = any, else CSV); absent on pre-spawns files. */
 	spawns?: string;
 	/** The agent's `readSummarize` setting (`false` = read summarization disabled); absent uses the session default. */

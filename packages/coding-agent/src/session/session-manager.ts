@@ -3580,6 +3580,8 @@ export class SessionManager {
 		outputSchema?: unknown;
 		outputSchemaMode?: StructuredSubagentSchemaMode;
 		restrictToolNames?: boolean;
+		forkOfParent?: boolean;
+		mountedToolNames?: string[];
 		spawns?: string;
 		readSummarize?: boolean;
 		advisor?: string;
@@ -4571,6 +4573,8 @@ export interface PersistedSessionInit {
 	outputSchema?: unknown;
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	restrictToolNames?: boolean;
+	forkOfParent?: boolean;
+	mountedToolNames?: string[];
 	spawns?: string;
 	readSummarize?: boolean;
 	advisor?: string;
@@ -4599,6 +4603,8 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			outputSchema: entry.outputSchema,
 			outputSchemaMode: entry.outputSchemaMode,
 			restrictToolNames: entry.restrictToolNames,
+			forkOfParent: entry.forkOfParent,
+			mountedToolNames: entry.mountedToolNames,
 			readSummarize: entry.readSummarize,
 			spawns: entry.spawns,
 			advisor: entry.advisor,

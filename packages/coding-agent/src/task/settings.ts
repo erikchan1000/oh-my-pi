@@ -347,6 +347,38 @@ export const cfgTaskMaxRecursionDepth = register({
 	},
 });
 
+export const cfgTaskForkEnabled = register({
+	id: "task.forkEnabled",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Forked-Context Tasks",
+		description:
+			"Allow task items to set `fork: true`: the child branches the live parent session, inherits its conversation and shares its prompt cache. Every fork child re-sends the parent prefix on each turn, so keep the parent small.",
+	},
+});
+
+export const cfgTaskForkMaxParentTokens = register({
+	id: "task.forkMaxParentTokens",
+	type: "number",
+	default: 60000,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Fork Max Parent Tokens",
+		description:
+			"Refuse `fork: true` task spawns when the parent context exceeds this many tokens (each fork child re-sends the parent prefix at cache-read price every turn).",
+		options: [
+			{ value: "30000", label: "30k tokens" },
+			{ value: "60000", label: "60k tokens", description: "Default" },
+			{ value: "100000", label: "100k tokens" },
+			{ value: "200000", label: "200k tokens" },
+		],
+	},
+});
+
 export const cfgTaskMaxRuntimeMs = register({
 	id: "task.maxRuntimeMs",
 	type: "number",

@@ -329,6 +329,7 @@ import {
 	ASYNC_RESULT_MESSAGE_TYPE,
 	type AsyncResultEntry,
 	buildAsyncResultBatchMessage,
+	buildAsyncResultHeader,
 } from "./async-job-delivery";
 import { BashRunner, type BashRunnerHost } from "./bash-runner";
 import {
@@ -3417,7 +3418,28 @@ export class AgentSession implements SettingsScope {
 		// must not enqueue — the suppression marker alone is unreliable because
 		// job-id reuse clears it.
 		const epoch = this.#asyncDeliveryEpoch;
-		const formatted = await this.#formatAsyncResultForFollowUp(text, job?.latestDetails?.meta);
+		let formatted = await this.#formatAsyncResultForFollowUp(text, job?.latestDetails?.meta);
+		if (this.#isDisposed) return;
+		if (epoch !== this.#asyncDeliveryEpoch) return;
+		if (manager.isDeliverySuppressed(jobId)) return;
+		let rewritten = false;
+		if (job && this.#extensionRunner) {
+			if (job.status === "running") throw new Error(`async job ${jobId} delivered while running`);
+			const rewrite = await this.#extensionRunner.emitAsyncResult({
+				type: "async_result",
+				jobId,
+				jobType: job.type,
+				agentId: job.agentId,
+				label: job.label,
+				status: job.status,
+				text: formatted,
+			});
+			if (rewrite && (rewrite.suppress || rewrite.text !== undefined)) {
+				const header = buildAsyncResultHeader(job, jobId);
+				formatted = rewrite.suppress || !rewrite.text ? header : `${header}\n${rewrite.text}`;
+				rewritten = true;
+			}
+		}
 		if (this.#isDisposed) return;
 		if (epoch !== this.#asyncDeliveryEpoch) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
@@ -3428,6 +3450,7 @@ export class AgentSession implements SettingsScope {
 			job,
 			durationMs,
 			epoch,
+			rewritten,
 		});
 	}
 

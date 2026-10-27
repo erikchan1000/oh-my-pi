@@ -9,7 +9,7 @@ import { formatModelRoleAlias } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import { MCPManager } from "../mcp/manager";
 import { initializeExtensions } from "../modes/runtime-init";
-import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
+import { type PersistedSubagentReviverFactory, recordReviveRefusal } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
@@ -32,10 +32,12 @@ import {
 	subagentRetryFallbackRole,
 } from "./executor";
 import { isCompletionProbeEnabled } from "./completion-probe";
+import { readForkEntries, renderForkRefusal } from "./fork";
 import { cfgTaskAgentAccountPools } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
 import { seanceIsolationOptions } from "./seance-policy";
 import type { AgentDefinition } from "./types";
+import { getAdoptedSandbox } from "./worktree";
 
 /**
  * Ambient context the reviver needs at revive time. The top-level session is
@@ -120,15 +122,24 @@ export function createPersistedSubagentReviverFactory(
 			if (!restoredSeance) return undefined;
 		}
 		const seanceOptions = restoredSeance ? seanceIsolationOptions(restoredSeance.cwd) : {};
-		// Isolated runs are never resumable: their worktree is merged + cleaned,
-		// and the parent was told messaging is impossible. A retained workspace
-		// (capture/persist failure) still exists on disk and would pass the cwd
-		// probe below, so gate on the stamped contract instead — otherwise a
-		// restart + peer message revives the agent outside isolation, in the
-		// parent cwd, contradicting the delivery notice.
-		if (peek.init.isolated) return undefined;
+		// An isolated run revives only into a sandbox this process adopted through
+		// `omp --restore`, whose turn end captures and merges the sandbox's edits
+		// (honoring the spawn's apply decision). A cold revive from any other
+		// entry point (e.g. a peer message after a restart) would run in the
+		// sandbox with nothing to capture its edits, so it is refused, explicitly.
+		let isolatedWorkspace: string | undefined;
+		if (peek.init.isolated) {
+			const adopted = getAdoptedSandbox(path.dirname(sessionFile), ref.id);
+			if (!adopted) {
+				const refusal = `isolated agent: only \`omp --restore\` revives into its sandbox, since it captures and merges the sandbox's edits`;
+				logger.warn("Isolated subagent not revived", { id: ref.id, reason: refusal });
+				recordReviveRefusal(ref, refusal);
+				return undefined;
+			}
+			isolatedWorkspace = adopted.sidecar.workspacePath;
+		}
 		try {
-			await fs.stat(restoredSeance?.cwd ?? peek.cwd);
+			await fs.stat(isolatedWorkspace ?? restoredSeance?.cwd ?? peek.cwd);
 		} catch {
 			return undefined;
 		}
@@ -144,6 +155,14 @@ export function createPersistedSubagentReviverFactory(
 			parentId = registry.get(parentId)?.parentId;
 		}
 		return async expectedRef => {
+			// The sandbox is revived into only while a restore owns it: once its turn
+			// settled (merged and deleted, or kept for manual recovery) nothing
+			// captures edits made there, so a cached reviver must refuse.
+			if (isolatedWorkspace !== undefined && !getAdoptedSandbox(path.dirname(sessionFile), ref.id)) {
+				throw new Error(
+					`Cannot revive isolated subagent "${ref.id}": its restore finished and nothing would capture edits made in its sandbox ${isolatedWorkspace}.`,
+				);
+			}
 			// Re-open fresh on every revive: park closes the writer, so this takes
 			// the single-writer lock cleanly and restores the full message history.
 			const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
@@ -157,6 +176,13 @@ export function createPersistedSubagentReviverFactory(
 				throw new Error(
 					`Cannot revive subagent "${ref.id}": session file "${sessionFile}" has no persisted session contract. The agent was not revived.`,
 				);
+			}
+			// A fork child's `task_fork` marker without the persisted `forkOfParent` flag is an older file:
+			// its tool shape cannot be restored faithfully, so refuse instead of guessing.
+			const isForkChild = readForkEntries(entries).length > 0;
+			if (isForkChild && init.forkOfParent === undefined) {
+				await reopened.close();
+				throw new Error(renderForkRefusal({ reason: "legacyFork", id: ref.id }));
 			}
 			if (!hasConversationalHistory(entries)) {
 				await reopened.close();
@@ -172,6 +198,8 @@ export function createPersistedSubagentReviverFactory(
 			// in files written before that. Absent = unadvised (the
 			// createSubagentSettings default).
 			const subagentSettings = createSubagentSettings(ctx.settings, {
+				// Isolated runs must not expose roots outside the worktree.
+				...(isolatedWorkspace !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
 				...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 				...(init.advisor
 					? {
@@ -227,7 +255,7 @@ export function createPersistedSubagentReviverFactory(
 			let session: AgentSession;
 			try {
 				({ session } = await createAgentSession({
-					cwd: restoredSeance?.cwd ?? ctx.session.sessionManager.getCwd(),
+					cwd: isolatedWorkspace ?? restoredSeance?.cwd ?? ctx.session.sessionManager.getCwd(),
 					costGate: ctx.session.costGate,
 					authStorage: ctx.authStorage,
 					// Revived agents join the root session tree, so their observability
@@ -264,6 +292,10 @@ export function createPersistedSubagentReviverFactory(
 					oauthAccountPools,
 					expectedAgentRef: expectedRef,
 					taskDepth,
+					// A fork child keeps the parent's depth-gated tools and headless `ask`, as at spawn.
+					forkOfParent: init.forkOfParent,
+					advertiseHeadlessAsk: init.forkOfParent === true ? revivedToolNames.includes("ask") : undefined,
+					mountedToolNames: init.forkOfParent === true ? init.mountedToolNames : undefined,
 					toolNames: revivedToolNames,
 					outputSchema: init.outputSchema,
 					outputSchemaMode: init.outputSchemaMode,
@@ -300,9 +332,15 @@ export function createPersistedSubagentReviverFactory(
 			// Clamp the active set to the persisted list: createAgentSession's
 			// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 			// the original run didn't carry. Unknown/missing names are ignored.
-			await session.setActiveToolsByName(
-				restoredSeance ? revivedToolNames : [...revivedToolNames, ...session.getMountedXdevToolNames()],
-			);
+			if (init.forkOfParent === true) {
+				// Present tools exactly as the parent did (direct versus xd://-mounted).
+				if (!init.mountedToolNames) throw new Error(`Fork child "${ref.id}" has no persisted mounted tool names.`);
+				await session.setActiveToolPresentation(revivedToolNames, init.mountedToolNames);
+			} else {
+				await session.setActiveToolsByName(
+					restoredSeance ? revivedToolNames : [...revivedToolNames, ...session.getMountedXdevToolNames()],
+				);
+			}
 			// The yield tool's schema carries the last batch's items; the replayed prefix must match it.
 			if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
 			// Wire the extension runtime exactly as the live executor does. Without
