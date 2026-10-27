@@ -10,7 +10,7 @@ import { formatBytes, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my
 import type { SettingValueOf } from "../config/registry";
 
 import { withRepoLock } from "../utils/repo-lock";
-import { writeIsolationOwner } from "./isolation-ownership";
+import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, writeIsolationOwner } from "./isolation-ownership";
 import { mapWithConcurrencyLimit } from "./parallel";
 import type { cfgIsolationBackend } from "./settings";
 
@@ -385,12 +385,68 @@ function parseDiffGitLinePaths(line: string): string[] {
 	return [...new Set(paths)];
 }
 
-function patchTouchedFiles(patch: string): string[] {
+export function patchTouchedFiles(patch: string): string[] {
 	const files = new Set<string>();
 	for (const line of patch.split("\n")) {
 		for (const file of parseDiffGitLinePaths(line)) files.add(file);
 	}
 	return [...files];
+}
+
+/**
+ * Whether `patch` applies to `repo` under `options`. A native VCS error means
+ * the probe could not run to a positive verdict (e.g. a preimage blob missing
+ * from the ODB for a 3-way probe) and counts as "does not apply"; any other
+ * error (I/O, a corrupt repository) propagates instead of reading as a conflict.
+ */
+export async function probePatchApplies(
+	repo: VcsGitRepo,
+	patch: string,
+	options: { reverse?: boolean; threeWay?: boolean },
+): Promise<boolean> {
+	try {
+		return await repo.canApplyPatch(patch, options);
+	} catch (error) {
+		if (vcs.isVcsError(error)) return false;
+		throw error;
+	}
+}
+
+/**
+ * Apply one patch to `repo`, falling back to a 3-way merge when the forward
+ * apply is impossible (a sibling's merged hunk shifted the context).
+ *
+ * Native apply is all-or-nothing, so a `"conflict"` result guarantees the
+ * working tree is untouched. A 3-way probe/apply failure (conflicting hunks or
+ * preimage blobs missing from the parent ODB) is reported as `"conflict"`, never
+ * defaulted to success. The caller must hold the repo lock for `repo`.
+ *
+ * @param forwardApplies Result of a prior forward `canApplyPatch` probe.
+ */
+export async function applyPatchWithThreeWayFallback(
+	repo: VcsGitRepo,
+	patch: string,
+	forwardApplies: boolean,
+): Promise<"applied" | "conflict"> {
+	if (forwardApplies) {
+		try {
+			await repo.applyPatch(patch, {});
+			return "applied";
+		} catch (error) {
+			if (!vcs.isVcsError(error)) throw error;
+			// Fall through: all-or-nothing apply left the tree untouched.
+		}
+	}
+	// A VCS-error probe means the 3-way merge cannot run (e.g. missing preimage blob).
+	const threeWayApplies = await probePatchApplies(repo, patch, { threeWay: true });
+	if (!threeWayApplies) return "conflict";
+	try {
+		await repo.applyPatch(patch, { threeWay: true });
+		return "applied";
+	} catch (error) {
+		if (!vcs.isVcsError(error)) throw error;
+		return "conflict";
+	}
 }
 
 export interface DeltaPatchResult {
@@ -488,36 +544,52 @@ export async function applyNestedPatches(
 		const combinedDiff = repoPatches.map(p => p.patch).join("\n");
 		const touchedFiles = [...new Set(repoPatches.flatMap(p => patchTouchedFiles(p.patch)))];
 
-		// Preserve any pre-existing dirty state (tracked + untracked) so we
-		// commit only the agent delta, not the user's in-flight work.
-		const stashed = (await repository.isDirty())
-			? await repository.stashPush(`omp-isolation-${Snowflake.next()}`)
-			: false;
-		try {
-			for (const { patch } of repoPatches) {
-				await repository.applyPatch(patch, {});
-			}
-			if (await repository.isDirty()) {
-				if (touchedFiles.length === 0) {
-					throw new Error(`Nested repo patch for ${relativePath} did not include stageable file paths.`);
+		// One lock per nested repo: stash -> apply -> commit -> pop must not
+		// interleave with a sibling's, or a stash captures its fresh patch.
+		await withRepoLock(nestedDir, async () => {
+			// Preserve any pre-existing dirty state (tracked + untracked) so we
+			// commit only the agent delta, not the user's in-flight work.
+			const stashed = (await repository.isDirty())
+				? await repository.stashPush(`omp-isolation-${Snowflake.next()}`)
+				: false;
+			try {
+				const applied: string[] = [];
+				for (const { patch } of repoPatches) {
+					const forwardApplies = await probePatchApplies(repository, patch, {});
+					const outcome = await applyPatchWithThreeWayFallback(repository, patch, forwardApplies);
+					if (outcome === "conflict") {
+						// Native apply is all-or-nothing per patch, but earlier patches of this
+						// group are already in the tree, uncommitted; undo them (newest first) so
+						// the stash pop below does not land on top of a half-applied group.
+						for (const earlier of applied.reverse()) await repository.applyPatch(earlier, { reverse: true });
+						throw new Error(
+							`Nested repo patch for ${relativePath} conflicts with the current tree: ${patchTouchedFiles(patch).join(", ")}`,
+						);
+					}
+					applied.push(patch);
 				}
-				const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
-				await repository.stageFiles(touchedFiles);
-				await repository.commitCreate(msg, {});
-			}
-		} finally {
-			if (stashed) {
-				const restored = await repository.stashTryPop(true).catch(() => false);
-				if (!restored) {
-					logger.warn("Pre-existing nested-repo dirty state could not be auto-restored", {
-						nestedDir,
-					});
-					warnings.push(
-						`Pre-existing dirty state in nested repo \`${relativePath}\` could not be auto-restored after the agent commit; stash entry preserved.`,
-					);
+				if (await repository.isDirty()) {
+					if (touchedFiles.length === 0) {
+						throw new Error(`Nested repo patch for ${relativePath} did not include stageable file paths.`);
+					}
+					const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
+					await repository.stageFiles(touchedFiles);
+					await repository.commitCreate(msg, {});
+				}
+			} finally {
+				if (stashed) {
+					const restored = await repository.stashTryPop(true).catch(() => false);
+					if (!restored) {
+						logger.warn("Pre-existing nested-repo dirty state could not be auto-restored", {
+							nestedDir,
+						});
+						warnings.push(
+							`Pre-existing dirty state in nested repo \`${relativePath}\` could not be auto-restored after the agent commit; stash entry preserved.`,
+						);
+					}
 				}
 			}
-		}
+		});
 	}
 	return warnings;
 }
@@ -714,6 +786,206 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
 		const baseDir = path.dirname(handle.mergedDir);
 		await fs.rm(baseDir, { recursive: true, force: true });
 	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Isolation sidecar (crash-durable re-adoption of a sandbox)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Setup facts of one isolated subagent, persisted next to its transcript
+ * BEFORE the subprocess starts so a new process (`omp --restore`, cold revive)
+ * can re-adopt the surviving sandbox and still compute its delta patch.
+ * Holds only isolation setup facts, never transcript or tool output.
+ */
+export interface IsolationSidecar {
+	version: 1;
+	agentId: string;
+	backend: IsoBackendKind;
+	/** The sandbox's merged dir (`IsolationHandle.mergedDir`). */
+	workspacePath: string;
+	repoRoot: string;
+	baseline: WorktreeBaseline;
+	mergeMode: "patch" | "branch";
+	/** The spawn's apply decision; `false` means a restored run captures but never applies. */
+	applyChanges: boolean;
+	description?: string;
+}
+
+export function isolationSidecarPath(artifactsDir: string, agentId: string): string {
+	return path.join(artifactsDir, `${agentId}.isolation.json`);
+}
+
+/** Atomically persist `sidecar` (temp file + rename). Throws on failure. */
+export async function writeIsolationSidecar(artifactsDir: string, sidecar: IsolationSidecar): Promise<void> {
+	const target = isolationSidecarPath(artifactsDir, sidecar.agentId);
+	const temp = `${target}.${process.pid}.${Snowflake.next()}.tmp`;
+	await Bun.write(temp, JSON.stringify(sidecar));
+	try {
+		await fs.rename(temp, target);
+	} catch (error) {
+		await fs.rm(temp, { force: true });
+		throw error;
+	}
+}
+
+function parseIsolationSidecar(decoded: unknown, file: string): IsolationSidecar {
+	const malformed = (what: string): Error => new Error(`Isolation sidecar ${file} is malformed: ${what}`);
+	if (typeof decoded !== "object" || decoded === null) throw malformed("not an object");
+	const record = decoded as Record<string, unknown>;
+	if (record.version !== 1)
+		throw new Error(`Isolation sidecar ${file} has unsupported version ${String(record.version)}`);
+	for (const key of ["agentId", "workspacePath", "repoRoot"] as const) {
+		if (typeof record[key] !== "string" || record[key] === "") throw malformed(`${key} must be a non-empty string`);
+	}
+	if (typeof record.backend !== "number") throw malformed("backend must be a number");
+	if (record.mergeMode !== "patch" && record.mergeMode !== "branch")
+		throw malformed("mergeMode must be patch or branch");
+	if (typeof record.applyChanges !== "boolean") throw malformed("applyChanges must be a boolean");
+	if (record.description !== undefined && typeof record.description !== "string") {
+		throw malformed("description must be a string");
+	}
+	const baseline = record.baseline as { root?: { headCommit?: unknown }; nested?: unknown } | null | undefined;
+	if (typeof baseline !== "object" || baseline === null) throw malformed("baseline missing");
+	if (typeof baseline.root?.headCommit !== "string" || baseline.root.headCommit === "") {
+		throw malformed("baseline.root.headCommit must be a non-empty string");
+	}
+	if (!Array.isArray(baseline.nested)) throw malformed("baseline.nested must be an array");
+	return decoded as IsolationSidecar;
+}
+
+/**
+ * Read the sidecar of `agentId`. `undefined` ONLY when none exists; malformed
+ * JSON or an unsupported `version` throws.
+ */
+export async function readIsolationSidecar(
+	artifactsDir: string,
+	agentId: string,
+): Promise<IsolationSidecar | undefined> {
+	const file = isolationSidecarPath(artifactsDir, agentId);
+	let decoded: unknown;
+	try {
+		decoded = await Bun.file(file).json();
+	} catch (error) {
+		if (isEnoent(error)) return undefined;
+		throw error;
+	}
+	return parseIsolationSidecar(decoded, file);
+}
+
+/** Remove the sidecar once its sandbox is gone; absent is fine. */
+export async function removeIsolationSidecar(artifactsDir: string, agentId: string): Promise<void> {
+	await fs.rm(isolationSidecarPath(artifactsDir, agentId), { force: true });
+	adoptedSandboxes.delete(adoptedKey(artifactsDir, agentId));
+	priorOwnerMarkers.delete(adoptedKey(artifactsDir, agentId));
+}
+
+type AdoptedSandbox = Extract<AdoptIsolatedSandboxResult, { ok: true }>;
+
+/** Sandboxes this process has adopted, so the reviver reuses restore's adoption instead of re-adopting. */
+const adoptedSandboxes = new Map<string, AdoptedSandbox>();
+/** Owner-marker bytes from before this process claimed the sandbox, to undo an abandoned adoption. */
+const priorOwnerMarkers = new Map<string, string>();
+
+function adoptedKey(artifactsDir: string, agentId: string): string {
+	return `${path.resolve(artifactsDir)}\0${agentId}`;
+}
+
+/** Drop this process's adoption of `agentId`'s sandbox without touching disk (sandbox kept for manual recovery). */
+export function forgetAdoptedSandbox(artifactsDir: string, agentId: string): void {
+	adoptedSandboxes.delete(adoptedKey(artifactsDir, agentId));
+	priorOwnerMarkers.delete(adoptedKey(artifactsDir, agentId));
+}
+
+/**
+ * Undo an adoption that never got to run (e.g. job registration failed): drop
+ * the map entry and put the previous owner marker back, so the sandbox is
+ * re-adoptable by a later restore instead of looking owned by this process.
+ */
+export async function abandonAdoptedSandbox(artifactsDir: string, agentId: string): Promise<void> {
+	const key = adoptedKey(artifactsDir, agentId);
+	const adopted = adoptedSandboxes.get(key);
+	const prior = priorOwnerMarkers.get(key);
+	forgetAdoptedSandbox(artifactsDir, agentId);
+	if (adopted && prior !== undefined) {
+		await Bun.write(path.join(path.dirname(adopted.sidecar.workspacePath), ISOLATION_OWNER_FILE), prior);
+	}
+}
+
+/**
+ * The adoption this process already made for `agentId` (by `--restore`), or
+ * `undefined`. A sandbox is revived into only after it was adopted by a flow
+ * that captures and merges its edits when the turn ends.
+ */
+export function getAdoptedSandbox(artifactsDir: string, agentId: string): AdoptedSandbox | undefined {
+	return adoptedSandboxes.get(adoptedKey(artifactsDir, agentId));
+}
+
+export type AdoptIsolatedSandboxResult =
+	| { ok: true; sidecar: IsolationSidecar; handle: IsolationHandle }
+	| { ok: false; reason: string };
+
+/**
+ * Re-adopt the sandbox a previous process left behind for `agentId`, or say
+ * exactly why it cannot be: no sidecar, sandbox gone, owner mismatch, another
+ * live owner, or the baseline commit no longer in the repo. On success the
+ * current process claims ownership so `omp worktree clear` does not reap it.
+ */
+export async function adoptIsolatedSandbox(artifactsDir: string, agentId: string): Promise<AdoptIsolatedSandboxResult> {
+	// Idempotent within the owning process: a second adoption is the same claim.
+	const already = getAdoptedSandbox(artifactsDir, agentId);
+	if (already) return already;
+	let sidecar: IsolationSidecar | undefined;
+	try {
+		sidecar = await readIsolationSidecar(artifactsDir, agentId);
+	} catch (error) {
+		return { ok: false, reason: `isolation sidecar unreadable: ${errorMessage(error)}` };
+	}
+	if (!sidecar) return { ok: false, reason: `no isolation sidecar for ${agentId} in ${artifactsDir}` };
+	const { workspacePath } = sidecar;
+	try {
+		await fs.stat(workspacePath);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		return { ok: false, reason: `sandbox workspace ${workspacePath} is missing` };
+	}
+	const baseDir = path.dirname(workspacePath);
+	let priorOwnerMarker: string;
+	try {
+		priorOwnerMarker = await Bun.file(path.join(baseDir, ISOLATION_OWNER_FILE)).text();
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		return { ok: false, reason: `sandbox owner marker missing in ${baseDir}` };
+	}
+	let owner: unknown;
+	try {
+		owner = JSON.parse(priorOwnerMarker);
+	} catch {
+		return { ok: false, reason: `sandbox owner marker in ${baseDir} is not valid JSON` };
+	}
+	const ownerId = typeof owner === "object" && owner !== null ? (owner as { id?: unknown }).id : undefined;
+	if (ownerId !== agentId) {
+		return { ok: false, reason: `sandbox ${baseDir} is owned by ${String(ownerId)}, not ${agentId}` };
+	}
+	if (await hasLiveIsolationOwner(baseDir)) {
+		return { ok: false, reason: `sandbox ${baseDir} is still owned by a live process` };
+	}
+	const headCommit = sidecar.baseline.root.headCommit;
+	if (!(await vcs.requireGit(sidecar.repoRoot).refExists(headCommit))) {
+		return {
+			ok: false,
+			reason: `baseline commit ${headCommit} no longer exists in ${sidecar.repoRoot}; sandbox kept at ${workspacePath}`,
+		};
+	}
+	await writeIsolationOwner(baseDir, agentId);
+	const adopted: AdoptedSandbox = {
+		ok: true,
+		sidecar,
+		handle: { mergedDir: workspacePath, backend: sidecar.backend, fellBack: false, fallbackReason: null },
+	};
+	adoptedSandboxes.set(adoptedKey(artifactsDir, agentId), adopted);
+	priorOwnerMarkers.set(adoptedKey(artifactsDir, agentId), priorOwnerMarker);
+	return adopted;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

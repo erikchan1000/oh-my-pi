@@ -49,6 +49,8 @@ import type {
 	AssistantMessageRewriteEvent,
 	AssistantMessageRewriteResult,
 	AssistantThinkingRenderer,
+	AsyncResultEvent,
+	AsyncResultEventResult,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	BeforeProviderRequestEvent,
@@ -2320,5 +2322,38 @@ export class ExtensionRunner {
 		}
 
 		return chosen;
+	}
+
+	/**
+	 * Runs `async_result` handlers in extension order; each sees the previous handler's replaced `text`,
+	 * and `suppress` from any handler wins.
+	 */
+	async emitAsyncResult(event: AsyncResultEvent): Promise<AsyncResultEventResult | undefined> {
+		if (!this.hasHandlers("async_result")) return undefined;
+		const ctx = this.createContext();
+		let text: string | undefined;
+		let suppress = false;
+
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("async_result");
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				const current: AsyncResultEvent = text === undefined ? event : { ...event, text };
+				const handlerResult = await this.#runHandlerWithTimeout(
+					handler,
+					current,
+					ctx,
+					ext,
+					extensionHandlerTimeoutMs,
+				);
+				if (!handlerResult) continue;
+				const result = handlerResult as AsyncResultEventResult;
+				if (result.text !== undefined) text = result.text;
+				if (result.suppress) suppress = true;
+			}
+		}
+
+		return { text, suppress };
 	}
 }

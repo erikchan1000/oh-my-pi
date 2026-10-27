@@ -35,8 +35,10 @@ import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "./executor";
+import type { ForkSpawnSpec } from "./fork";
 import {
 	applyEligibleNestedPatches,
+	describeCapturedChanges,
 	type IsolationContext,
 	makeIsolationCommitMessage,
 	mergeIsolatedChanges,
@@ -163,6 +165,8 @@ export interface StructuredSubagentRequest {
 	onProgress?: (progress: AgentProgress) => void;
 	/** See {@link ExecutorOptions.onToolResult}. */
 	onToolResult?: (result: SubagentToolResult) => void;
+	/** Forked-context spawn snapshot taken at dispatch; absent for cold spawns. */
+	forkSpec?: ForkSpawnSpec;
 }
 
 /** A normalized preflight result, reusable by tests and adapters. */
@@ -652,6 +656,7 @@ function buildExecutorOptions(
 		enableMCP,
 		customTools: request.customTools,
 		workPoolYieldItems: request.workPoolYieldItems,
+		forkSpec: request.forkSpec,
 		contextFiles: session.contextFiles,
 		noContextFiles: session.noContextFiles,
 		skills,
@@ -754,23 +759,6 @@ async function isolationRecoveryHint(result: SingleResult, artifactsDir: string)
 		branchName: result.branchName,
 	});
 	return hint ? ` ${hint}` : "";
-}
-
-/**
- * Summary for an isolated run whose changes are captured but deliberately not
- * applied (`task.isolation.apply=false`). Every captured artifact is named:
- * the root patch only when it holds changes, and each nested-repo patch file,
- * so the parent knows exactly where the work lives.
- */
-function describeCapturedChanges(result: SingleResult): string {
-	const nestedPatchPaths = result.nestedPatchPaths ?? [];
-	return renderIsolationSummary({
-		kind: "captured",
-		branchName: result.branchName,
-		rootPatchPath: result.hasRootChanges === false ? undefined : result.patchPath,
-		nestedCount: nestedPatchPaths.length || (result.nestedPatches?.length ?? 0),
-		nestedPatchPaths,
-	});
 }
 
 function attachStructuredOutputMetadata(result: SingleResult, schema: StructuredSubagentSchemaResolution): void {
@@ -888,6 +876,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 					preferredBackend: parseIsolationBackend(cfgIsolationBackend.get(request.session.settings)),
 					agentId: id,
 					mergeMode: policy.mergeMode,
+					applyChanges: policy.applyChanges,
 					artifactsDir: lease.artifactsDir,
 					description: trimToUndefined(request.identity?.label),
 					buildCommitMessage: makeIsolationCommitMessage(request.session),

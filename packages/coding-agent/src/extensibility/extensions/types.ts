@@ -84,6 +84,7 @@ import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
+import type { AsyncJob, AsyncJobType } from "../../async";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
 import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
@@ -1090,6 +1091,19 @@ export interface BeforeSubagentSpawnEvent {
 	spawnKey?: string;
 }
 
+/** Fired in the owning session for each settled async job (`task`, `bash`, `eval`) before its result is queued for injection. */
+export interface AsyncResultEvent {
+	type: "async_result";
+	jobId: string;
+	jobType: AsyncJobType;
+	/** Registry id of the subagent a `task` job ran. */
+	agentId?: string;
+	label?: string;
+	status: Exclude<AsyncJob["status"], "running">;
+	/** Already-formatted inline result the owner would otherwise receive. */
+	text: string;
+}
+
 export type {
 	AgentEndEvent,
 	AgentStartEvent,
@@ -1480,6 +1494,7 @@ export type ExtensionEvent =
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
 	| BeforeSubagentSpawnEvent
+	| AsyncResultEvent
 	| AgentStartEvent
 	| AgentEndEvent
 	| SessionStopEvent
@@ -1579,6 +1594,13 @@ export interface BeforeSubagentSpawnEventResult {
 	reason?: string;
 	/** Human-readable routing explanation surfaced with the resolved model. */
 	note?: string;
+}
+
+export interface AsyncResultEventResult {
+	/** Replacement body; core still prepends the status line and `agent://` / `proc://` pointer. */
+	text?: string;
+	/** Deliver the status line and pointer only, no body. Any handler setting it wins. */
+	suppress?: boolean;
 }
 
 export type {
@@ -1686,6 +1708,7 @@ export interface ExtensionAPI {
 		event: "before_subagent_spawn",
 		handler: ExtensionHandler<BeforeSubagentSpawnEvent, BeforeSubagentSpawnEventResult>,
 	): void;
+	on(event: "async_result", handler: ExtensionHandler<AsyncResultEvent, AsyncResultEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
 	on(event: "session_stop", handler: ExtensionHandler<SessionStopEvent, SessionStopEventResult>): void;

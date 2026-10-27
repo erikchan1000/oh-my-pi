@@ -30,6 +30,7 @@ import { AgentRegistry } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import { trackLateCleanup } from "../utils/late-cleanup";
+import { withRepoLock } from "../utils/repo-lock";
 import type { ExecutorOptions } from "./executor";
 import { runSubprocess } from "./executor";
 import { needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
@@ -45,8 +46,14 @@ import {
 	ensureIsolation,
 	getRepoRoot,
 	type IsolationHandle,
+	type IsolationSidecar,
+	applyPatchWithThreeWayFallback,
 	mergeTaskBranches,
+	patchTouchedFiles,
+	probePatchApplies,
+	removeIsolationSidecar,
 	type WorktreeBaseline,
+	writeIsolationSidecar,
 } from "./worktree";
 
 import { cfgTaskIsolationCommits } from "./settings";
@@ -59,6 +66,7 @@ export type IsolationSummaryKind =
 	| "capture-error"
 	| "nested-apply-failed"
 	| "not-applied"
+	| "patch-conflict"
 	| "branch-merge-failed"
 	| "branch-capture-failed"
 	| "merge-error";
@@ -73,6 +81,8 @@ export interface IsolationSummaryContext {
 	nestedPatchPaths?: string[];
 	error?: string;
 	conflict?: string;
+	/** Paths whose hunks conflict with the current parent tree (`patch-conflict`). */
+	conflictPaths?: string[];
 }
 
 /**
@@ -198,6 +208,11 @@ export interface IsolatedRunOptions {
 	artifactsDir: string;
 	/** Human description carried onto the branch commit (branch mode). */
 	description?: string;
+	/**
+	 * The spawn's apply decision, persisted in the isolation sidecar so a
+	 * restored run honors it (`false` ⇒ captured, never applied).
+	 */
+	applyChanges: boolean;
 	/** Build a commit-message callback (`task.isolation.commits === "ai"`). */
 	buildCommitMessage?: BuildCommitMessage;
 	/**
@@ -356,6 +371,138 @@ function renderIsolationError(context: IsolationErrorContext): string {
 	return prompt.render(isolationErrorTemplate, { ...context });
 }
 
+/** What {@link captureIsolatedResult} decided about a finished isolated run. */
+interface IsolatedCapture {
+	/** The artifact-bearing result; `undefined` when the run did not succeed, which captures nothing. */
+	result: SingleResult | undefined;
+	/** The workspace was kept (moved to a `.retained-*` sibling) because capture failed. */
+	retained: boolean;
+	/** Fingerprint of the delta handed to the caller, when one was. */
+	handedOff: bigint | number | undefined;
+}
+
+interface CaptureIsolatedResultOptions {
+	result: SingleResult;
+	isolationDir: string;
+	isolationBackend: IsoBackendKind;
+	baseline: WorktreeBaseline;
+	repoRoot: string;
+	mergeMode: "patch" | "branch";
+	artifactsDir: string;
+	agentId: string;
+	description: string | undefined;
+	buildCommitMessage: BuildCommitMessage | undefined;
+}
+
+/**
+ * Post-run tail of an isolated run, shared by live runs and runs re-adopted
+ * after a restart: capture the finished sandbox's changes (branch commit or
+ * patch files) onto `result`.
+ */
+async function captureIsolatedResult(opts: CaptureIsolatedResultOptions): Promise<IsolatedCapture> {
+	const { result, isolationDir, isolationBackend, baseline, repoRoot, mergeMode, artifactsDir, agentId, description } =
+		opts;
+	const { buildCommitMessage } = opts;
+	let workspaceRetained = false;
+	let handedOff: bigint | number | undefined;
+	const done = (captured: SingleResult): IsolatedCapture => ({
+		result: captured,
+		retained: workspaceRetained,
+		handedOff,
+	});
+	if (mergeMode === "branch" && result.exitCode === 0) {
+		let commitResult: CommitToBranchResult | null;
+		try {
+			commitResult = await commitToBranch(isolationDir, baseline, agentId, description, buildCommitMessage?.());
+		} catch (mergeErr) {
+			// Agent succeeded but the branch commit failed. `commitToBranch`
+			// is not atomic: the clean-baseline path fetches the agent's
+			// commits into the parent ODB and creates `omp/task/<id>` before
+			// it commits the leftover working-tree delta, so a throw from
+			// that trailing step leaves behind a branch that already holds
+			// every commit the agent made. The isolation worktree — the only
+			// other copy of those objects — is destroyed by the `finally`
+			// below, so deleting the branch unconditionally turned a
+			// recoverable merge conflict into permanent loss of committed
+			// work (#8868). Delete only when nothing is at stake.
+			const baseSha = baseline.root.headCommit;
+			const branchName = `omp/task/${agentId}`;
+			const rescueBranch = await rescueTaskBranch(repoRoot, branchName, baseSha);
+			const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
+			try {
+				const capture = await writeIsolationPatch(isolationDir, baseline, artifactsDir, agentId);
+				return done({
+					...result,
+					...capture.artifacts,
+					error: renderIsolationError({ kind: "merge-failed", message: msg, rescueBranch }),
+				});
+			} catch (patchErr) {
+				workspaceRetained = true;
+				const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
+				return done({
+					...result,
+					error: renderIsolationError({
+						kind: "merge-failed",
+						message: msg,
+						captureError: patchErr instanceof Error ? patchErr.message : String(patchErr),
+						rescueBranch,
+						retainedDir: retained.dir,
+						sidecarMissing: !retained.sidecarOk,
+					}),
+				});
+			}
+		}
+		handedOff = deltaFingerprint(commitResult?.rootPatch ?? "", commitResult?.nestedPatches ?? []);
+		// The branch holds the root-repo work, but nested-repo patches exist
+		// only in memory until written; the workspace goes away in `finally`.
+		try {
+			const nestedPatchPaths = await persistNestedPatches(artifactsDir, agentId, commitResult?.nestedPatches ?? []);
+			return done({
+				...result,
+				branchName: commitResult?.branchName,
+				branchBaseSha: commitResult?.baseSha,
+				nestedPatches: commitResult?.nestedPatches,
+				nestedPatchPaths,
+			});
+		} catch (persistErr) {
+			workspaceRetained = true;
+			const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
+			return done({
+				...result,
+				branchName: commitResult?.branchName,
+				branchBaseSha: commitResult?.baseSha,
+				nestedPatches: commitResult?.nestedPatches,
+				error: renderIsolationError({
+					kind: "nested-capture-failed",
+					message: persistErr instanceof Error ? persistErr.message : String(persistErr),
+					retainedDir: retained.dir,
+					sidecarMissing: !retained.sidecarOk,
+				}),
+			});
+		}
+	}
+	if (result.exitCode === 0) {
+		try {
+			const capture = await writeIsolationPatch(isolationDir, baseline, artifactsDir, agentId);
+			handedOff = capture.fingerprint;
+			return done({ ...result, ...capture.artifacts });
+		} catch (patchErr) {
+			workspaceRetained = true;
+			const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
+			return done({
+				...result,
+				error: renderIsolationError({
+					kind: "patch-capture-failed",
+					message: patchErr instanceof Error ? patchErr.message : String(patchErr),
+					retainedDir: retained.dir,
+					sidecarMissing: !retained.sidecarOk,
+				}),
+			});
+		}
+	}
+	return { result: undefined, retained: workspaceRetained, handedOff };
+}
+
 /**
  * Run a subagent inside an isolation worktree and capture its changes.
  *
@@ -399,7 +546,10 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	const cleanupHandle = (): Promise<void> => {
 		cleanupPromise ??= (async () => {
 			await releaseBase();
-			if (handle && !retainWorkspace) await cleanupIsolation(handle);
+			if (handle && !retainWorkspace) {
+				await cleanupIsolation(handle);
+				await removeIsolationSidecar(opts.artifactsDir, opts.agentId);
+			}
 		})();
 		return cleanupPromise;
 	};
@@ -457,6 +607,20 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		const isolationBackend = handle.backend;
 		const baseline = await captureIsolationBaseline(isolationDir, opts.context.repoRoot);
 		taskBaseline = baseline;
+		// Persist the setup facts BEFORE the subprocess starts: a crash mid-run
+		// must leave enough on disk for `--restore` to re-adopt the sandbox. A
+		// write failure fails isolation setup (catch below; finally cleans up).
+		await writeIsolationSidecar(opts.artifactsDir, {
+			version: 1,
+			agentId: opts.agentId,
+			backend: isolationBackend,
+			workspacePath: isolationDir,
+			repoRoot: opts.context.repoRoot,
+			baseline,
+			mergeMode: opts.mergeMode,
+			applyChanges: opts.applyChanges,
+			...(opts.description !== undefined ? { description: opts.description } : {}),
+		});
 		const result = await runSubprocess({
 			...opts.baseOptions,
 			worktree: isolationDir,
@@ -484,106 +648,21 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		if (deferredCleanup && result.exitCode === 0) {
 			await deferredCleanup;
 		}
-		if (opts.mergeMode === "branch" && result.exitCode === 0) {
-			let commitResult: CommitToBranchResult | null;
-			try {
-				commitResult = await commitToBranch(
-					isolationDir,
-					baseline,
-					opts.agentId,
-					opts.description,
-					opts.buildCommitMessage?.(),
-				);
-			} catch (mergeErr) {
-				// Agent succeeded but the branch commit failed. `commitToBranch`
-				// is not atomic: the clean-baseline path fetches the agent's
-				// commits into the parent ODB and creates `omp/task/<id>` before
-				// it commits the leftover working-tree delta, so a throw from
-				// that trailing step leaves behind a branch that already holds
-				// every commit the agent made. The isolation worktree — the only
-				// other copy of those objects — is destroyed by the `finally`
-				// below, so deleting the branch unconditionally turned a
-				// recoverable merge conflict into permanent loss of committed
-				// work (#8868). Delete only when nothing is at stake.
-				const baseSha = baseline.root.headCommit;
-				const branchName = `omp/task/${opts.agentId}`;
-				const rescueBranch = await rescueTaskBranch(opts.context.repoRoot, branchName, baseSha);
-				const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
-				try {
-					const capture = await writeIsolationPatch(isolationDir, baseline, opts.artifactsDir, opts.agentId);
-					return rememberAgentArtifacts({
-						...result,
-						...capture.artifacts,
-						error: renderIsolationError({ kind: "merge-failed", message: msg, rescueBranch }),
-					});
-				} catch (patchErr) {
-					retainWorkspace = true;
-					const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
-					return rememberAgentArtifacts({
-						...result,
-						error: renderIsolationError({
-							kind: "merge-failed",
-							message: msg,
-							captureError: patchErr instanceof Error ? patchErr.message : String(patchErr),
-							rescueBranch,
-							retainedDir: retained.dir,
-							sidecarMissing: !retained.sidecarOk,
-						}),
-					});
-				}
-			}
-			handedOff = deltaFingerprint(commitResult?.rootPatch ?? "", commitResult?.nestedPatches ?? []);
-			// The branch holds the root-repo work, but nested-repo patches exist
-			// only in memory until written; the workspace goes away in `finally`.
-			try {
-				const nestedPatchPaths = await persistNestedPatches(
-					opts.artifactsDir,
-					opts.agentId,
-					commitResult?.nestedPatches ?? [],
-				);
-				return rememberAgentArtifacts({
-					...result,
-					branchName: commitResult?.branchName,
-					branchBaseSha: commitResult?.baseSha,
-					nestedPatches: commitResult?.nestedPatches,
-					nestedPatchPaths,
-				});
-			} catch (persistErr) {
-				retainWorkspace = true;
-				const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
-				return rememberAgentArtifacts({
-					...result,
-					branchName: commitResult?.branchName,
-					branchBaseSha: commitResult?.baseSha,
-					nestedPatches: commitResult?.nestedPatches,
-					error: renderIsolationError({
-						kind: "nested-capture-failed",
-						message: persistErr instanceof Error ? persistErr.message : String(persistErr),
-						retainedDir: retained.dir,
-						sidecarMissing: !retained.sidecarOk,
-					}),
-				});
-			}
-		}
-		if (result.exitCode === 0) {
-			try {
-				const capture = await writeIsolationPatch(isolationDir, baseline, opts.artifactsDir, opts.agentId);
-				handedOff = capture.fingerprint;
-				return rememberAgentArtifacts({ ...result, ...capture.artifacts });
-			} catch (patchErr) {
-				retainWorkspace = true;
-				const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
-				return rememberAgentArtifacts({
-					...result,
-					error: renderIsolationError({
-						kind: "patch-capture-failed",
-						message: patchErr instanceof Error ? patchErr.message : String(patchErr),
-						retainedDir: retained.dir,
-						sidecarMissing: !retained.sidecarOk,
-					}),
-				});
-			}
-		}
+		const captured = await captureIsolatedResult({
+			result,
+			isolationDir,
+			isolationBackend,
+			baseline,
+			repoRoot: opts.context.repoRoot,
+			mergeMode: opts.mergeMode,
+			artifactsDir: opts.artifactsDir,
+			agentId: opts.agentId,
+			description: opts.description,
+			buildCommitMessage: opts.buildCommitMessage,
+		});
+		if (captured.retained) retainWorkspace = true;
+		if (captured.handedOff !== undefined) handedOff = captured.handedOff;
+		if (captured.result) return rememberAgentArtifacts(captured.result);
 		return rememberAgentArtifacts(result);
 	} catch (err) {
 		return rememberAgentArtifacts(opts.buildFailureResult(err));
@@ -706,6 +785,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
 		// aborted run has nothing to apply and must not block the result.
 		let changesApplied: boolean;
 		let hadAnyChanges: boolean;
+		let conflictPaths: string[] | undefined;
 		const succeeded = result.exitCode === 0 && !result.error && !result.aborted;
 		if (!succeeded) {
 			changesApplied = true;
@@ -720,38 +800,40 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
 				hadAnyChanges = false;
 			} else {
 				const normalized = patchText.endsWith("\n") ? patchText : `${patchText}\n`;
-				// Idempotence: declare a no-op only when the reverse patch applies AND
-				// the forward patch does not. `--reverse --check` alone can theoretically
-				// succeed if the file happens to carry the postimage at another location
-				// via git-apply's fuzz factor; requiring the forward check to fail
-				// removes that ambiguity while still catching true already-applied
-				// runs. Reads only — neither call touches the worktree, unlike
-				// `--3way --check`, which exits 0 even when the real apply would
-				// leave conflict markers and unmerged index entries.
-				const [alreadyApplied, forwardApplies] = await Promise.all([
-					repo.canApplyPatch(normalized, { reverse: true }).catch(() => false),
-					repo.canApplyPatch(normalized, {}).catch(() => false),
-				]);
-				hadAnyChanges = false;
-				if (alreadyApplied && !forwardApplies) {
-					changesApplied = true;
-				} else if (forwardApplies) {
-					changesApplied = true;
-					try {
-						await repo.applyPatch(normalized, {});
-						hadAnyChanges = true;
-					} catch {
-						changesApplied = false;
-					}
-				} else {
-					changesApplied = false;
-				}
+				// Serialize check+apply per repo: native apply is read-map -> apply ->
+				// write-map, so concurrent sibling merge-backs would lose updates.
+				// Branch mode locks inside `mergeTaskBranches`; never nest here.
+				const outcome = await withRepoLock(repoRoot, async () => {
+					// Idempotence: declare a no-op only when the reverse patch applies AND
+					// the forward patch does not. `--reverse --check` alone can theoretically
+					// succeed if the file happens to carry the postimage at another location
+					// via git-apply's fuzz factor; requiring the forward check to fail
+					// removes that ambiguity while still catching true already-applied
+					// runs. Reads only — neither call touches the worktree.
+					const [alreadyApplied, forwardApplies] = await Promise.all([
+						probePatchApplies(repo, normalized, { reverse: true }),
+						probePatchApplies(repo, normalized, {}),
+					]);
+					if (alreadyApplied && !forwardApplies) return "already-applied" as const;
+					return applyPatchWithThreeWayFallback(repo, normalized, forwardApplies);
+				});
+				hadAnyChanges = outcome === "applied";
+				changesApplied = outcome !== "conflict";
+				if (outcome === "conflict") conflictPaths = patchTouchedFiles(normalized);
 			}
 		}
 
 		let summary: string;
 		if (changesApplied) {
 			summary = hadAnyChanges ? "\n\nApplied patches: yes" : "\n\nNo changes to apply.";
+		} else if (conflictPaths) {
+			// Tree is untouched (native apply is all-or-nothing); the patch artifact stays.
+			summary = renderIsolationSummary({
+				kind: "patch-conflict",
+				conflictPaths,
+				rootPatchPath: result.patchPath,
+				nestedPatchPaths: result.nestedPatchPaths,
+			});
 		} else {
 			// Nested apply is skipped when the root patch did not apply; the
 			// persisted nested patches are the parent's only pointer to that work.
@@ -823,4 +905,88 @@ export async function applyEligibleNestedPatches(opts: NestedPatchApplyOptions):
 			nestedPatchPaths: result.nestedPatchPaths,
 		});
 	}
+}
+
+/**
+ * Render the `apply=false` outcome: where the captured changes were left,
+ * with no merge attempted.
+ */
+export function describeCapturedChanges(result: SingleResult): string {
+	const nestedPatchPaths = result.nestedPatchPaths ?? [];
+	return renderIsolationSummary({
+		kind: "captured",
+		branchName: result.branchName,
+		rootPatchPath: result.hasRootChanges === false ? undefined : result.patchPath,
+		nestedCount: nestedPatchPaths.length || (result.nestedPatches?.length ?? 0),
+		nestedPatchPaths,
+	});
+}
+
+export interface FinishAdoptedIsolationOptions {
+	sidecar: IsolationSidecar;
+	handle: IsolationHandle;
+	/** The restored turn's result; must be a successful one. */
+	result: SingleResult;
+	artifactsDir: string;
+}
+
+/**
+ * Finish a sandbox re-adopted by `adoptIsolatedSandbox` after its interrupted
+ * turn completed: the same capture tail a live run uses, then (only when the
+ * original spawn had `apply` on) the exported merge, with the summaries
+ * appended to `result.output`. An `apply=false` spawn is captured but never
+ * merged. The sandbox is cleaned up unless capture failed and retained it.
+ * Callers pass only successful results; a failed turn leaves the sandbox alone.
+ */
+export async function finishAdoptedIsolation(opts: FinishAdoptedIsolationOptions): Promise<SingleResult> {
+	const { sidecar, handle, artifactsDir } = opts;
+	const captured = await captureIsolatedResult({
+		result: opts.result,
+		isolationDir: handle.mergedDir,
+		isolationBackend: handle.backend,
+		baseline: sidecar.baseline,
+		repoRoot: sidecar.repoRoot,
+		mergeMode: sidecar.mergeMode,
+		artifactsDir,
+		agentId: sidecar.agentId,
+		description: sidecar.description,
+		buildCommitMessage: undefined,
+	});
+	if (!captured.result) throw new Error(`Adopted isolation for ${sidecar.agentId} was given a non-successful result`);
+	let result = rememberAgentArtifacts(captured.result);
+	let summary = "";
+	if (result.error) {
+		// Capture failed: the changes were not landed; `error` names the retained workspace.
+		summary = renderIsolationSummary({
+			kind: "capture-error",
+			error: result.error,
+			branchName: result.branchName,
+			rootPatchPath: result.hasRootChanges === false ? undefined : result.patchPath,
+			nestedPatchPaths: result.nestedPatchPaths ?? [],
+		});
+	} else if (!sidecar.applyChanges) {
+		summary = describeCapturedChanges(result);
+	} else {
+		const outcome = await mergeIsolatedChanges({
+			result,
+			repoRoot: sidecar.repoRoot,
+			mergeMode: sidecar.mergeMode,
+		});
+		summary = outcome.summary;
+		if (outcome.changesApplied !== false) {
+			summary += await applyEligibleNestedPatches({
+				result,
+				repoRoot: sidecar.repoRoot,
+				mergeMode: sidecar.mergeMode,
+				changesApplied: outcome.changesApplied,
+				mergedBranchForNestedPatches: outcome.mergedBranchForNestedPatches,
+			});
+		}
+	}
+	result = { ...result, output: `${result.output}${summary}` };
+	if (!captured.retained) {
+		await cleanupIsolation(handle);
+		await removeIsolationSidecar(artifactsDir, sidecar.agentId);
+	}
+	return result;
 }

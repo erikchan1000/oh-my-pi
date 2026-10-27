@@ -120,6 +120,7 @@ import {
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 } from "./types";
 import { seanceIsolationOptions } from "./seance-policy";
+import { createForkChildManager, type ForkSpawnSpec, renderForkRefusal } from "./fork";
 import type { PreparedSeanceSession } from "./seance";
 import {
 	type AgentProgress,
@@ -463,6 +464,8 @@ export interface ExecutorOptions {
 	 * Eval `agent(..., schema=...)` sets this so built-in agents ignore stale yield labels.
 	 */
 	outputSchemaOverridesAgent?: boolean;
+	/** Forked-context spawn: branch the live parent instead of starting cold (see ./fork). */
+	forkSpec?: ForkSpawnSpec;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
 	/**
@@ -2443,9 +2446,11 @@ async function driveSessionToResult(
 		onPromptBusy?: () => Promise<void>;
 		/** Go on with the interrupted turn instead of sending `task`, which only labels the run. */
 		restore?: boolean;
+		/** The transcript already ends with the assignment (a fork's seed tool result): run the next turn from it. */
+		continueFromTail?: boolean;
 	} = {},
 ): Promise<DriveOutcome> {
-	const { solutionSpace, onPromptBusy, restore } = options;
+	const { solutionSpace, onPromptBusy, restore, continueFromTail } = options;
 	const structured = options.structured !== false;
 	using _keepalive = new EventLoopKeepalive();
 	const abortSignal = monitor.abortSignal;
@@ -2529,6 +2534,7 @@ async function driveSessionToResult(
 			for (;;) {
 				try {
 					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
+					else if (continueFromTail) await awaitAbortable(session.agent.continue(abortSignal));
 					else await dispatchPrompt(task, { attribution: "agent", solutionSpace }, "initial prompt");
 					break;
 				} catch (error) {
@@ -3892,6 +3898,8 @@ interface SubagentPromptInputs {
 	ircRoster?: IrcPeerRosterData;
 	/** Set while a warm revive rebuilds the session. */
 	reviving: boolean;
+	/** Forked-context child: the parent's base system prompt, reused byte for byte (identity lives in the seed tool result). */
+	forkSystemPrompt?: readonly string[];
 }
 
 /**
@@ -3947,6 +3955,7 @@ function buildSubagentSessionOptions(
 		resolveServiceTierByFamily: launch?.resolveServiceTierByFamily,
 		onFirstChatDispatch: launch?.onFirstChatDispatch,
 		systemPrompt: defaultPrompt => {
+			if (inputs.forkSystemPrompt) return [...inputs.forkSystemPrompt];
 			// A revive shows the roster the parked session's prompt held, as the cached prompt prefix
 			// does: a live one would make every revival a cache miss for a change it would not have
 			// seen had it stayed live.
@@ -4202,8 +4211,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		onProgress,
 	} = options;
 	const preparedSession = options.preparedSession;
+	// Forked-context spawn handed over by TaskTool (see ./fork). Fork children have no `yield`
+	// tool: the parent's tool list is reused exactly, so the final assistant message is the result.
+	const forkSpec = options.forkSpec;
 	const cleanupGraceMs = options.cleanupGraceMs ?? TASK_ABORT_CLEANUP_GRACE_MS;
-	const structured = options.structured !== false;
+	const structured = options.structured !== false && forkSpec === undefined;
 	const startTime = Date.now();
 	// Set by the session's onFirstChatDispatch hook the first time the agent
 	// loop dispatches a chat request to the provider — the launch-complete boundary.
@@ -4322,9 +4334,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	) {
 		toolNames = [...toolNames, "wait"];
 	}
+	// A fork child reuses the parent's exact tool list; the agent role's tools do not apply.
+	if (forkSpec) toolNames = [...forkSpec.toolNames];
 	// Inbound steering works without messaging; outbound peer coordination requires write.
+	// Fork children never inherit IRC queues or roster.
 	const ircEnabled =
 		!preparedSession &&
+		!forkSpec &&
 		options.enableIrc !== false &&
 		isIrcEnabled(subagentSettings, childDepth) &&
 		(toolNames === undefined || toolNames.includes("write"));
@@ -4474,7 +4490,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						)
 					: undefined;
 			const {
-				model,
+				model: resolvedAgentModel,
 				thinkingLevel: resolvedThinkingLevel,
 				explicitThinkingLevel,
 				authFallbackUsed,
@@ -4488,6 +4504,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					id,
 				),
 			);
+			// A fork child runs on the parent's exact model so the provider prompt cache is shared.
+			const model = forkSpec ? forkSpec.model : resolvedAgentModel;
 			if (modelResolutionWarning) {
 				logger.warn("Subagent model resolution warning", {
 					warning: modelResolutionWarning,
@@ -4557,29 +4575,33 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Precedence: caller `effort` > explicit `:level` suffix on the resolved
 			// model pattern > agent-definition default (e.g. task's `auto`) >
 			// pattern-derived level.
-			const effectiveThinkingLevel =
-				effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel));
+			const effectiveThinkingLevel = forkSpec
+				? forkSpec.thinkingLevel
+				: (effortLevel ??
+					(explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel)));
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
 			const fork = preparedSession?.fork;
 			if (fork && !subtaskSessionFile) {
 				throw new Error("The prepared session fork requires a persisted child session file.");
 			}
-			const sessionManagerPromise = fork
-				? SessionManager.forkFrom(fork.sourceFile, effectiveCwd, undefined, undefined, {
-						seance: true,
-						suppressBreadcrumb: true,
-						sessionFile: subtaskSessionFile,
-						resetInheritedCost: true,
-						repairInterruptedTail: true,
-					})
-				: sessionFile
-					? SessionManager.open(sessionFile, undefined, undefined, {
-							initialCwd: effectiveCwd,
-							parentSession: options.sessionFile ?? undefined,
+			const sessionManagerPromise = forkSpec
+				? createForkChildManager(forkSpec, effectiveCwd, subtaskSessionFile, id, options.assignment ?? task)
+				: fork
+					? SessionManager.forkFrom(fork.sourceFile, effectiveCwd, undefined, undefined, {
+							seance: true,
 							suppressBreadcrumb: true,
+							sessionFile: subtaskSessionFile,
+							resetInheritedCost: true,
+							repairInterruptedTail: true,
 						})
-					: Promise.resolve(SessionManager.inMemory(effectiveCwd));
+					: sessionFile
+						? SessionManager.open(sessionFile, undefined, undefined, {
+								initialCwd: effectiveCwd,
+								parentSession: options.sessionFile ?? undefined,
+								suppressBreadcrumb: true,
+							})
+						: Promise.resolve(SessionManager.inMemory(effectiveCwd));
 			if (preparedSession) pendingSessionManager = sessionManagerPromise;
 			// Setup below can fail before this promise's consumption boundary.
 			// Observe rejection immediately while preserving it for the later await.
@@ -4703,8 +4725,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 					hasUI: false,
 					prewalk,
-					spawns: spawnsEnv,
+					spawns: forkSpec ? forkSpec.spawns : spawnsEnv,
+					// The parent's UI-only `ask` stays advertised in the headless child so the tool list matches.
+					advertiseHeadlessAsk: forkSpec?.toolNames.includes("ask"),
+					mountedToolNames: forkSpec?.mountedToolNames,
 					taskDepth: childDepth,
+					// A fork child keeps the parent's depth-gated tools; the recursion cap is enforced at execution.
+					forkOfParent: forkSpec !== undefined,
 					// The whole spawn tree shares the root session's observability bus,
 					// so nested lifecycle/progress/event frames reach its surfaces
 					// without leaking into another root session's traffic.
@@ -4726,6 +4753,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					customTools: options.customTools,
 					localProtocolOptions: options.localProtocolOptions,
 					telemetry: subagentTelemetry,
+					// Fork children inherit the parent's prompt cache key so the prefix is a cache hit.
+					...(forkSpec
+						? { providerPromptCacheKey: forkSpec.promptCacheKey, providerPromptCacheKeySource: "fork" as const }
+						: {}),
 					// Seance isolation overrides every inherited field above in one place.
 					...(preparedSession ? seanceIsolationOptions(effectiveCwd) : {}),
 				},
@@ -4745,6 +4776,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					ircRoot: {},
 					ircRenders: new Map(),
 					reviving: false,
+					forkSystemPrompt: forkSpec?.systemPrompt,
 				},
 			};
 
@@ -4788,7 +4820,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// request on an opted-in model persists it to the header so fork and
 				// reopen keep it. An empty parent lineage derives no candidate:
 				// ":<agent>" would coalesce every such parent onto one family.
-				if (options.parentPromptCacheKey) {
+				if (options.parentPromptCacheKey && !forkSpec) {
 					sessionManager.setTaskSiblingCandidate(`${options.parentPromptCacheKey}:${agent.name}`);
 				}
 			} catch (err) {
@@ -4809,6 +4841,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				throw err;
 			}
 			mcpFollower?.bind(session);
+			// Present tools exactly as the parent does (direct versus xd://-mounted) so the provider tool prefix matches.
+			if (forkSpec) {
+				await awaitAbortable(session.setActiveToolPresentation(forkSpec.toolNames, forkSpec.mountedToolNames));
+			}
 			// The SDK records a new session's initial model as the default role.
 			// Pin the child's own chain so a parent default sharing that model
 			// cannot steal its fallback routing. Resumed history keeps its role.
@@ -4847,7 +4883,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Todos are parent-owned bookkeeping and stripped from subagents —
 			// except under prewalk, whose plan nudge + todo gate require the
 			// subagent to commit its own todo list before the hand-off.
-			const isParentOwnedTool = (name: string): boolean => !prewalk && name === "todo";
+			const isParentOwnedTool = (name: string): boolean => !prewalk && !forkSpec && name === "todo";
 			if (sessionFile !== null) {
 				const reviveCapture: WarmReviveCapture = {
 					sessionFile,
@@ -4888,6 +4924,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				await awaitAbortable(session.setWorkPoolYieldItems(options.workPoolYieldItems));
 			}
 			const enabledSubagentTools = session.getEnabledToolNames();
+			if (forkSpec) {
+				const parentTools = new Set(forkSpec.toolNames);
+				const same =
+					enabledSubagentTools.length === parentTools.size &&
+					enabledSubagentTools.every(name => parentTools.has(name));
+				if (!same) {
+					throw new Error(
+						renderForkRefusal({
+							reason: "toolDrift",
+							childTools: enabledSubagentTools.join(", "),
+							parentTools: forkSpec.toolNames.join(", "),
+						}),
+					);
+				}
+			}
 			// The enabled set includes the synthetic write transport injected for
 			// explicit tool lists that omitted write. `session_init.tools` is later
 			// replayed as an explicit grant during cold revival, so persist write
@@ -4909,13 +4960,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// so read it back from the settings both install paths write.
 				retryFallback: getRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(id)),
 				readOnly: isReadOnlyAgent(agent),
-				spawns: spawnsEnv,
+				spawns: forkSpec ? forkSpec.spawns : spawnsEnv,
 				readSummarize: agent.readSummarize,
 				advisor: advisorSelection ? (advisorRolePattern ?? "on") : undefined,
 				compactionThreshold: options.compactionThresholdOverride,
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
+				forkOfParent: forkSpec ? true : undefined,
+				mountedToolNames: forkSpec?.mountedToolNames,
 				// Isolated runs are never revivable (worktree merged + cleaned):
 				// stamp the contract so cold revival leaves them transcript-only
 				// even when the workspace was retained for recovery.
@@ -4982,6 +5035,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const outcome = await driveSessionToResult(session, monitor, task, {
 				solutionSpace: options.solutionSpace,
 				structured,
+				continueFromTail: forkSpec !== undefined,
 			});
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left

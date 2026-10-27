@@ -68,6 +68,17 @@ async function removeAgentTombstone(id: string, sessionFile: string): Promise<vo
  */
 export type PersistedSubagentReviverFactory = (ref: AgentRef) => Promise<AgentReviver | undefined>;
 
+const reviveRefusals = new WeakMap<AgentRef, string>();
+
+/**
+ * Called by a {@link PersistedSubagentReviverFactory} that returns `undefined`
+ * on purpose: the reason is shown by {@link AgentLifecycleManager.ensureLive}
+ * instead of the generic "no reviver registered".
+ */
+export function recordReviveRefusal(ref: AgentRef, reason: string): void {
+	reviveRefusals.set(ref, reason);
+}
+
 export interface AdoptOptions {
 	/** TTL before an idle agent is parked. <= 0 disables parking. */
 	idleTtlMs: number;
@@ -459,8 +470,9 @@ export class AgentLifecycleManager {
 			);
 		}
 		if (!reviver) {
+			const why = reviveRefusals.get(killed) ?? "no session contract, isolated run, or its workspace is gone";
 			throw new Error(
-				`Agent "${id}" was killed and its transcript cannot be resumed (no session contract, isolated run, or its workspace is gone). Read history://${id} for what it did.`,
+				`Agent "${id}" was killed and its transcript cannot be resumed (${why}). Read history://${id} for what it did.`,
 			);
 		}
 		const reopened = this.#registry.reopen(id, killed);
@@ -501,7 +513,7 @@ export class AgentLifecycleManager {
 		}
 		if (ref.status !== "parked" || !revive || !adoption) {
 			throw new Error(
-				`Agent "${id}" is ${ref.status} and cannot be revived${revive ? "" : " (no reviver registered)"}. Its transcript remains readable at history://${id}.`,
+				`Agent "${id}" is ${ref.status} and cannot be revived${revive ? "" : ` (${reviveRefusals.get(ref) ?? "no reviver registered"})`}. Its transcript remains readable at history://${id}.`,
 			);
 		}
 		try {

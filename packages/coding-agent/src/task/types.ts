@@ -1,4 +1,5 @@
-import type { AgentSource } from "@oh-my-pi/pi-tui/tools/task";
+import type { AgentSource, TaskItem } from "@oh-my-pi/pi-tui/tools/task";
+import type { ForkSpawnSpec } from "./fork";
 export {
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
@@ -53,6 +54,7 @@ export const taskItemSchema = type({
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"fork?": "boolean",
 	"+": "delete",
 });
 const taskItemSchemaIsolated = type({
@@ -64,6 +66,7 @@ const taskItemSchemaIsolated = type({
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
 	"isolated?": "boolean",
+	"fork?": "boolean",
 	"+": "delete",
 });
 
@@ -76,6 +79,7 @@ export const taskSchema = type({
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
 	"isolated?": "boolean",
+	"fork?": "boolean",
 	"+": "delete",
 });
 const taskSchemaNoIsolation = type({
@@ -86,6 +90,7 @@ const taskSchemaNoIsolation = type({
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"fork?": "boolean",
 	"+": "delete",
 });
 function guardBatchAgent(schema: BaseType): BaseType {
@@ -164,6 +169,7 @@ function createTaskSchema(options: {
 				...schemaFields,
 				...toolsField,
 				...seanceFields,
+				"fork?": "boolean",
 				"isolated?": "boolean",
 				"+": "delete",
 			});
@@ -184,6 +190,7 @@ function createTaskSchema(options: {
 			...schemaFields,
 			...toolsField,
 			...seanceFields,
+			"fork?": "boolean",
 			"+": "delete",
 		});
 		return guardBatchAgent(
@@ -204,6 +211,7 @@ function createTaskSchema(options: {
 			...schemaFields,
 			...toolsField,
 			...seanceFields,
+			"fork?": "boolean",
 			"isolated?": "boolean",
 			"+": "delete",
 		});
@@ -217,6 +225,7 @@ function createTaskSchema(options: {
 		...schemaFields,
 		...toolsField,
 		...seanceFields,
+		"fork?": "boolean",
 		"+": "delete",
 	});
 }
@@ -289,4 +298,9 @@ export interface AgentDefinition {
 	advisor?: boolean | string;
 	source: AgentSource;
 	filePath?: string;
+}
+
+/** A task item plus the dispatch-time fork snapshot; internal, never part of the wire schema. */
+export interface SpawnItem extends TaskItem {
+	forkSpec?: ForkSpawnSpec;
 }

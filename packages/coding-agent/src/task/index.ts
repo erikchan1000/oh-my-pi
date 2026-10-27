@@ -35,6 +35,16 @@ import taskCoordinationAdvisoryTemplate from "../prompts/tools/task-coordination
 import taskSpawnFeedbackTemplate from "../prompts/tools/task-spawn-feedback.md" with { type: "text" };
 import taskSpecializationAdvisoryTemplate from "../prompts/tools/task-specialization-advisory.md" with { type: "text" };
 import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { type: "text" };
+import taskForkGuardTemplate from "../prompts/tools/task-fork-guard.md" with { type: "text" };
+import {
+	buildForkEntry,
+	checkForkGuard,
+	type ForkAwareTaskParams,
+	type ForkRefusal,
+	type ForkSpawnSpec,
+	renderForkRefusal,
+} from "./fork";
+import { BUILTIN_TOOLS, HIDDEN_TOOLS, resolveBuiltinToolPlan } from "../tools";
 import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { hasWaitTool } from "../tools/wait";
@@ -44,7 +54,13 @@ import { formatTaskResultSummary } from "./result-summary";
 import { isScoutSpawnable, type ResolvedSpawnPolicy, resolveSpawnPolicy } from "./spawn-policy";
 import { isBundledSeance, seanceTaskGuidance, seanceTaskSchemaFields, validateSeanceParams } from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
-import { type AgentDefinition, canSpawnAtDepth, getTaskSchema, type TaskToolSchemaInstance } from "./types";
+import {
+	type AgentDefinition,
+	canSpawnAtDepth,
+	getTaskSchema,
+	type SpawnItem,
+	type TaskToolSchemaInstance,
+} from "./types";
 import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
@@ -74,6 +90,8 @@ import {
 	cfgTaskDisabledAgents,
 	cfgTaskEnableEffort,
 	cfgTaskEnableLsp,
+	cfgTaskForkEnabled,
+	cfgTaskForkMaxParentTokens,
 	cfgTaskIsolationApply,
 	cfgTaskIsolationEnabled,
 	cfgTaskMaxConcurrency,
@@ -159,6 +177,8 @@ interface TaskDescriptionOptions {
 	planMode: boolean;
 	asyncGuidance: string;
 	parentSpawns: string;
+	forkEnabled: boolean;
+	forkMaxParentTokens: number;
 }
 
 /** Plan mode hides seance; a `spawns` list led by it defaults to the next permitted agent. */
@@ -211,6 +231,8 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		seanceGuidance: seanceAgent && isBundledSeance(seanceAgent) ? seanceTaskGuidance : "",
 		ircEnabled: options.ircEnabled,
 		asyncGuidance: options.asyncGuidance,
+		forkEnabled: options.forkEnabled,
+		forkMaxParentTokens: options.forkMaxParentTokens,
 	});
 }
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
@@ -318,6 +340,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("tools" in params) item.tools = params.tools;
 	if ("effort" in params) item.effort = params.effort;
 	if ("isolated" in params) item.isolated = params.isolated;
+	if ("fork" in params) item.fork = params.fork;
 	if ("sourceSession" in params) item.sourceSession = params.sourceSession;
 	if ("model" in params) item.model = params.model;
 	return [item];
@@ -332,7 +355,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
  * distinguishes an absent `isolated` from an explicit one. The item's
  * `isolated` (batch form) wins over the top-level flag (flat form).
  */
-function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string): TaskParams {
+function spawnParamsFor(params: TaskParams, item: SpawnItem, defaultAgent: string): TaskParams {
 	const spawn: TaskParams = { agent: item.agent?.trim() || defaultAgent };
 	if (item.name !== undefined) spawn.name = item.name;
 	if (item.task !== undefined) spawn.task = item.task;
@@ -344,6 +367,8 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if ("effort" in item) spawn.effort = item.effort;
 	if ("sourceSession" in item) spawn.sourceSession = item.sourceSession;
 	if ("model" in item) spawn.model = item.model;
+	if (item.fork !== undefined) spawn.fork = item.fork;
+	if (item.forkSpec) (spawn as TaskParams & ForkAwareTaskParams).forkSpec = item.forkSpec;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -355,7 +380,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 /** A validated call's spawn list: its items and the per-spawn params each run receives. */
 interface SpawnPlan {
 	params: TaskParams;
-	items: TaskItem[];
+	items: SpawnItem[];
 	spawns: TaskParams[];
 }
 
@@ -760,6 +785,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			planMode,
 			asyncGuidance: this.delegationGuidance,
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
+			forkEnabled: cfgTaskForkEnabled.get(this.session.settings),
+			forkMaxParentTokens: cfgTaskForkMaxParentTokens.get(this.session.settings),
 		});
 	}
 	private constructor(
@@ -879,6 +906,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal: AbortSignal,
 	): Promise<SpawnRun | undefined> {
 		if (spawn.tools?.length && this.session.getPlanModeState?.()?.enabled === true) return undefined;
+		// Fork children branch the parent at dispatch time; `#dispatch` validates and snapshots them.
+		if (spawn.fork === true) return undefined;
+		// A fork child's replayed or over-depth `task` call must never start running.
+		if (this.#forkReplayGuard([spawn]) !== undefined) return undefined;
 		let blocking: boolean;
 		try {
 			blocking = (await this.#resolveSpawnPreflight(spawn)).effectiveAgent.blocking === true;
@@ -890,6 +921,97 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agentId = await this.#outputManager().allocate(spawn.name?.trim() || generateTaskName());
 		if (signal.aborted) return undefined;
 		return this.#launch({ toolCallId, params: spawn, index, agentId, detached });
+	}
+
+	/**
+	 * Replay guard for a forked-context child calling `task`. Returns a tool-result refusal for a call that
+	 * repeats a call pending in the inherited parent prefix, or that exceeds `task.maxRecursionDepth`.
+	 */
+	#forkReplayGuard(items: TaskItem[]): string | undefined {
+		// Only fork children carry an inherited `task_fork` entry; they always have a session manager.
+		if (this.session.forkOfParent !== true) return undefined;
+		const manager = this.session.sessionManager;
+		if (!manager) throw new Error("A fork child session must have a session manager.");
+		const branch = manager.getBranch();
+		const verdict = checkForkGuard(
+			branch,
+			items.map(item => (item.task ?? "").trim()),
+			canSpawnAtDepth(cfgTaskMaxRecursionDepth.get(this.session.settings), this.session.taskDepth ?? 0),
+		);
+		switch (verdict.kind) {
+			case "allow":
+				return undefined;
+			case "replay":
+				return prompt.render(taskForkGuardTemplate, { replay: true }).trim();
+			case "depth":
+				return prompt.render(taskForkGuardTemplate, { replay: false }).trim();
+			default:
+				throw new Error(`unexpected fork guard verdict: ${JSON.stringify(verdict)}`);
+		}
+	}
+
+	/**
+	 * Validate and snapshot the live parent for `fork: true` items. Refuses explicitly (never a cold child)
+	 * when forking is disabled, the parent cannot be branched, or its context is too large to re-send per child turn.
+	 */
+	async #prepareFork(toolCallId: string, forkItems: TaskItem[]): Promise<ForkSpawnSpec | string> {
+		const refuse = (refusal: ForkRefusal) => renderForkRefusal(refusal);
+		const settings = this.session.settings;
+		if (!cfgTaskForkEnabled.get(settings)) return refuse({ reason: "disabled" });
+		for (const item of forkItems) {
+			for (const field of ["model", "effort", "outputSchema"] as const) {
+				if (item[field] !== undefined) return refuse({ reason: "conflict", field });
+			}
+		}
+		const manager = this.session.sessionManager;
+		const sessionFile = this.session.getSessionFile();
+		if (!manager || !sessionFile) return refuse({ reason: "noSessionFile" });
+		const agentId = this.session.getAgentId?.();
+		if (!agentId) return refuse({ reason: "noAgentId" });
+		const parent = AgentRegistry.global().get(agentId)?.session;
+		if (!parent) return refuse({ reason: "noParent" });
+		const usage = parent.getContextUsage();
+		if (!usage) return refuse({ reason: "noUsage" });
+		const maxTokens = cfgTaskForkMaxParentTokens.get(settings);
+		if (usage.tokens > maxTokens) return refuse({ reason: "tooLarge", tokens: usage.tokens, maxTokens });
+		const leafId = manager.getLeafId?.();
+		const model = parent.model;
+		const promptCacheKey = this.session.getPromptCacheKey?.();
+		if (!leafId || !model || !promptCacheKey) return refuse({ reason: "missingState" });
+		// Parity gate: MCP, extension and custom tools are minted per child session and cannot be
+		// guaranteed byte-identical, so a fork that would lose the parent's prompt cache is refused up front.
+		const toolNames = parent.getEnabledToolNames();
+		const unsupported = toolNames.filter(name => !(name in BUILTIN_TOOLS) && !(name in HIDDEN_TOOLS));
+		if (unsupported.length > 0) return refuse({ reason: "unsupportedTools", tools: unsupported.join(", ") });
+		// Child-shaped plan: the child is headless (`ask` stays advertised, see the executor), one level
+		// deeper, and keeps the parent's depth-gated tools. Any parent tool it would lose is refused here.
+		const childSession = Object.create(this.session, {
+			hasUI: { value: false },
+			canPromptUser: { value: false },
+			taskDepth: { value: (this.session.taskDepth ?? 0) + 1 },
+			forkOfParent: { value: true },
+			advertiseHeadlessAsk: { value: toolNames.includes("ask") },
+			requireYieldTool: { value: false },
+			skipPythonPreflight: { value: true },
+		}) as ToolSession;
+		const childPlan = new Set((await resolveBuiltinToolPlan(childSession, toolNames)).names);
+		const missing = toolNames.filter(name => !childPlan.has(name));
+		if (missing.length > 0) return refuse({ reason: "missingTools", tools: missing.join(", ") });
+		await manager.ensureOnDisk();
+		await manager.flush();
+		return {
+			sourceFile: sessionFile,
+			leafId,
+			systemPrompt: [...parent.baseSystemPrompt],
+			model,
+			thinkingLevel: parent.thinkingLevel,
+			toolNames,
+			mountedToolNames: parent.getMountedXdevToolNames(),
+			promptCacheKey,
+			spawns: this.session.getSessionSpawns() ?? "*",
+			toolCallId,
+			entry: buildForkEntry(manager.getBranch(), toolCallId),
+		};
 	}
 
 	#getSpawnSemaphore(): Semaphore {
@@ -971,7 +1093,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (typeof plan === "string") {
 			return createTaskModeError(plan);
 		}
-		const { params, items: spawnItems, spawns: normalizedSpawnParams } = plan;
+		const { params, items: planItems, spawns: planSpawnParams } = plan;
+		let spawnItems = planItems;
+		let normalizedSpawnParams = planSpawnParams;
+		const guardRefusal = this.#forkReplayGuard(spawnItems);
+		if (guardRefusal !== undefined) return createTaskModeError(guardRefusal);
+		const forkItems = spawnItems.filter(item => item.fork === true);
+		if (forkItems.length > 0) {
+			const forkSpec = await this.#prepareFork(toolCallId, forkItems);
+			if (typeof forkSpec === "string") return createTaskModeError(forkSpec);
+			// The snapshot rides each fork item (copied, so the model's own args are never mutated) and
+			// from there each spawn's params via `spawnParamsFor`; nothing outlives the call.
+			spawnItems = planItems.map(item => (item.fork === true ? { ...item, forkSpec } : item));
+			normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
+		}
 		const evalToolNames = spawnItems.flatMap(item => item.tools ?? []);
 		if (evalToolNames.length > 0) {
 			if (this.session.getPlanModeState?.()?.enabled === true) {
@@ -1737,10 +1872,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
+		const forkSpec = (params as TaskParams & ForkAwareTaskParams).forkSpec;
+		if (params.fork === true && !forkSpec) {
+			throw new Error(`fork spawn ${spawnIndex} of ${toolCallId} reached execution without a dispatch snapshot`);
+		}
 		const context = this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined;
 		let latestProgress: AgentProgress | undefined;
 		try {
 			const execution = await runStructuredSubagent({
+				forkSpec,
 				session: this.session,
 				invocationKind: "task",
 				assignment,

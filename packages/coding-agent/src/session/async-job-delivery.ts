@@ -10,6 +10,7 @@
  */
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobType } from "../async";
+import asyncResultHeaderTemplate from "../prompts/tools/async-result-header.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { escapeHarnessTags } from "./harness-tags";
@@ -33,6 +34,28 @@ export const ASYNC_PREVIEW_MAX_CHARS = 4_000;
  */
 export const ASYNC_PREVIEW_TAIL_CHARS = 1_000;
 
+/**
+ * Core-owned lead line of a handler-rewritten async result: type, id, settled
+ * status and the pointer to the full output. Handlers never produce it, so a
+ * rewrite or suppression cannot drop the status or the pointer.
+ */
+export function buildAsyncResultHeader(job: AsyncJob, jobId: string): string {
+	let pointer: string;
+	switch (job.type) {
+		case "task":
+			// Same convention as `agentUrlId` in buildAsyncResultBatchMessage: artifacts live under the agent id.
+			pointer = `agent://${job.agentId ?? jobId}`;
+			break;
+		case "bash":
+		case "eval":
+			pointer = `proc://${jobId}`;
+			break;
+		default:
+			throw new Error(`unexpected async job type: ${String(job.type)}`);
+	}
+	return prompt.render(asyncResultHeaderTemplate, { type: job.type, jobId, status: job.status, pointer });
+}
+
 export interface AsyncResultEntry {
 	jobId: string;
 	result: string;
@@ -46,6 +69,8 @@ export interface AsyncResultEntry {
 	 * the manager's per-id suppression marker.
 	 */
 	epoch: number;
+	/** An `async_result` handler replaced or suppressed the body; the job's raw images must not attach. */
+	rewritten?: boolean;
 }
 
 type AsyncResultJobDetails = {
@@ -145,7 +170,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 		multiple: jobs.length > 1,
 		jobs,
 	});
-	const images = entries.flatMap(entry => entry.job?.latestDetails?.images ?? []);
+	const images = entries.flatMap(entry => (entry.rewritten ? [] : (entry.job?.latestDetails?.images ?? [])));
 	return {
 		role: "custom",
 		customType: ASYNC_RESULT_MESSAGE_TYPE,

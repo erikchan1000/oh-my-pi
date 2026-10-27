@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { mergeIsolatedChanges } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import {
 	applyNestedPatches,
 	captureBaseline,
@@ -16,12 +17,32 @@ import {
 	IsolationBaselineTooLargeError,
 	mergeTaskBranches,
 	parseIsolationBackend,
+	probePatchApplies,
 } from "@oh-my-pi/pi-coding-agent/task/worktree";
+import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { removeWithRetries, setWorktreesDir } from "@oh-my-pi/pi-utils";
 
 const tempDirs: string[] = [];
+
+/** Line-numbered body; line-replacing edits keep every other line as stable context. */
+function numberedLines(count: number): string[] {
+	return Array.from({ length: count }, (_, i) => `line ${i}`);
+}
+
+/**
+ * Capture `git diff` for `file` rewritten to `lines`, then restore HEAD's copy.
+ * The diff carries real `index <old>..<new>` oids whose preimage blob is
+ * committed, so the native 3-way apply can resolve it.
+ */
+async function diffForEdit(repo: string, file: string, lines: string[]): Promise<string> {
+	await Bun.write(path.join(repo, file), `${lines.join("\n")}\n`);
+	const diff = await runGit(repo, ["diff", "--", file]);
+	await runGit(repo, ["checkout", "--", file]);
+	return `${diff}\n`;
+}
 
 async function runGit(repo: string, args: string[]): Promise<string> {
 	const proc = Bun.spawn(["git", ...args], {
@@ -1161,6 +1182,211 @@ describe("applyNestedPatches", () => {
 		expect(committedFiles.trim()).toBe("file.txt");
 		expect(stashList).toContain("omp-isolation-");
 	});
+
+	it("leaves the nested tree untouched when a later patch of the group conflicts", async () => {
+		const edit = (from: string, to: string) =>
+			`diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-${from}\n+${to}\n`;
+		await fs.writeFile(path.join(nestedDir, "other.txt"), "user wip\n");
+		const headBefore = await runGit(nestedDir, ["rev-parse", "HEAD"]);
+
+		// Both patches apply to the pristine tree; the second stops applying once the first landed.
+		await expect(
+			applyNestedPatches(parentRepo, [
+				{ relativePath: nestedRel, patch: edit("v1", "v2") },
+				{ relativePath: nestedRel, patch: edit("v1", "v3") },
+			]),
+		).rejects.toThrow(/conflicts with the current tree/);
+
+		expect(await fs.readFile(path.join(nestedDir, "file.txt"), "utf8")).toBe("v1\n");
+		expect(await runGit(nestedDir, ["rev-parse", "HEAD"])).toBe(headBefore);
+		expect(await runGit(nestedDir, ["status", "--porcelain=v1"])).toBe("?? other.txt");
+	});
+
+	// F01: stash -> apply -> commit -> pop ran unlocked, so two siblings' nested
+	// patches interleaved — one stash captured the other's freshly applied hunk
+	// (or the second stashPush/commit hit git's index.lock), losing an edit or
+	// the user's WIP. The per-nested-repo lock serializes the whole sequence.
+	it("serializes concurrent nested applies and restores pre-existing dirty state", async () => {
+		const base = numberedLines(400);
+		await Bun.write(path.join(nestedDir, "file.txt"), `${base.join("\n")}\n`);
+		await Bun.write(path.join(nestedDir, "notes.txt"), "notes v1\n");
+		await runGit(nestedDir, ["add", "."]);
+		await runGit(nestedDir, ["commit", "-q", "-m", "nested-base"]);
+
+		const editedA = [...base];
+		editedA[20] = "edited by A";
+		const editedB = [...base];
+		editedB[350] = "edited by B";
+		const patchA = await diffForEdit(nestedDir, "file.txt", editedA);
+		const patchB = await diffForEdit(nestedDir, "file.txt", editedB);
+
+		// Pre-existing user WIP: one tracked modification, one untracked file.
+		await Bun.write(path.join(nestedDir, "notes.txt"), "notes wip\n");
+		await Bun.write(path.join(nestedDir, "other.txt"), "user wip\n");
+
+		const [warningsA, warningsB] = await Promise.all([
+			applyNestedPatches(parentRepo, [{ relativePath: nestedRel, patch: patchA }]),
+			applyNestedPatches(parentRepo, [{ relativePath: nestedRel, patch: patchB }]),
+		]);
+		expect(warningsA).toEqual([]);
+		expect(warningsB).toEqual([]);
+
+		const [headFile, commitCount, agentCommitFiles, staged, unstaged, untracked, stashList, notes, other] =
+			await Promise.all([
+				runGit(nestedDir, ["show", "HEAD:file.txt"]),
+				runGit(nestedDir, ["rev-list", "--count", "HEAD"]),
+				runGit(nestedDir, ["log", "-2", "--name-only", "--pretty=format:"]),
+				runGit(nestedDir, ["diff", "--cached", "--name-only"]),
+				runGit(nestedDir, ["diff", "--name-only"]),
+				runGit(nestedDir, ["ls-files", "--others", "--exclude-standard"]),
+				runGit(nestedDir, ["stash", "list"]),
+				Bun.file(path.join(nestedDir, "notes.txt")).text(),
+				Bun.file(path.join(nestedDir, "other.txt")).text(),
+			]);
+		const expected = [...base];
+		expected[20] = "edited by A";
+		expected[350] = "edited by B";
+		// Both agent edits committed, each in its own commit touching only file.txt.
+		expect(`${headFile}\n`).toBe(`${expected.join("\n")}\n`);
+		expect(commitCount).toBe("4"); // nested-init + nested-base + A + B
+		expect(agentCommitFiles.split("\n").filter(Boolean)).toEqual(["file.txt", "file.txt"]);
+		// User WIP restored exactly, nothing left stashed.
+		expect(notes).toBe("notes wip\n");
+		expect(other).toBe("user wip\n");
+		// Tracked WIP back as an unstaged edit, untracked file still untracked.
+		expect(staged).toBe("");
+		expect(unstaged).toBe("notes.txt");
+		expect(untracked).toBe("other.txt");
+		expect(stashList).toBe("");
+	});
+});
+
+describe("mergeIsolatedChanges patch mode", () => {
+	let repo: string;
+	let artifactDir: string;
+	let base: string[];
+
+	beforeEach(async () => {
+		repo = await createGitRepo();
+		await runGit(repo, ["config", "user.email", "test@example.com"]);
+		await runGit(repo, ["config", "user.name", "Test User"]);
+		base = numberedLines(4000);
+		await Bun.write(path.join(repo, "shared.txt"), `${base.join("\n")}\n`);
+		await runGit(repo, ["add", "."]);
+		await runGit(repo, ["commit", "-q", "-m", "init"]);
+		artifactDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-merge-artifacts-"));
+		tempDirs.push(artifactDir);
+	});
+
+	/** Patch artifact for an isolated child that replaced the given lines of shared.txt. */
+	async function childPatch(id: string, edits: Record<number, string>): Promise<SingleResult> {
+		const lines = [...base];
+		for (const [index, text] of Object.entries(edits)) lines[Number(index)] = text;
+		const patchPath = path.join(artifactDir, `${id}.patch`);
+		await Bun.write(patchPath, await diffForEdit(repo, "shared.txt", lines));
+		return {
+			index: 0,
+			id,
+			agent: "task",
+			agentSource: "bundled",
+			task: id,
+			exitCode: 0,
+			output: "",
+			stderr: "",
+			truncated: false,
+			durationMs: 1,
+			tokens: 0,
+			requests: 1,
+			patchPath,
+		};
+	}
+
+	async function readShared(): Promise<string> {
+		return Bun.file(path.join(repo, "shared.txt")).text();
+	}
+
+	// F01 (a): native apply is read-map -> apply -> write-map on the blocking
+	// pool. Unlocked, concurrent siblings each read the pre-merge file and the
+	// last writer wins — an unlocked probe of 8 such applies kept exactly 1 edit
+	// while every call still reported "Applied patches: yes".
+	it("lands every concurrent sibling patch on the same file (no lost update)", async () => {
+		// Patches are captured one at a time (each capture rewrites shared.txt);
+		// only the merge-backs run concurrently.
+		const children: SingleResult[] = [];
+		for (let k = 0; k < 8; k++) {
+			children.push(await childPatch(`child-${k}`, { [100 + k * 450]: `edited by child ${k}` }));
+		}
+
+		const outcomes = await Promise.all(
+			children.map(result => mergeIsolatedChanges({ result, repoRoot: repo, mergeMode: "patch" })),
+		);
+
+		for (const outcome of outcomes) {
+			expect(outcome.changesApplied).toBe(true);
+			expect(outcome.hadAnyChanges).toBe(true);
+		}
+		const expected = [...base];
+		for (let k = 0; k < 8; k++) expected[100 + k * 450] = `edited by child ${k}`;
+		expect(await readShared()).toBe(`${expected.join("\n")}\n`);
+	});
+
+	// F01 (b): a sibling's hunk rewrote a line inside this patch's context, so
+	// the forward check fails; pre-fix this reported "not applied" even though a
+	// 3-way merge of non-overlapping edits succeeds.
+	it("applies a patch via 3-way when a sibling's merged hunk invalidated its context", async () => {
+		const first = await childPatch("first", { 10: "edited by first" });
+		const second = await childPatch("second", { 13: "edited by second" });
+
+		const firstOutcome = await mergeIsolatedChanges({ result: first, repoRoot: repo, mergeMode: "patch" });
+		expect(firstOutcome.changesApplied).toBe(true);
+		// Precondition: the forward apply of `second` is now impossible.
+		const secondPatch = await Bun.file(second.patchPath as string).text();
+		expect(await vcs.requireGit(repo).canApplyPatch(secondPatch, {})).toBe(false);
+
+		const secondOutcome = await mergeIsolatedChanges({ result: second, repoRoot: repo, mergeMode: "patch" });
+
+		expect(secondOutcome.changesApplied).toBe(true);
+		expect(secondOutcome.hadAnyChanges).toBe(true);
+		expect(secondOutcome.summary).toContain("Applied patches: yes");
+		const expected = [...base];
+		expected[10] = "edited by first";
+		expected[13] = "edited by second";
+		expect(await readShared()).toBe(`${expected.join("\n")}\n`);
+	});
+
+	// F01 (b, unresolvable): a truly conflicting patch must be an explicit,
+	// side-effect-free failure — tree untouched, artifact kept, path named.
+	it("reports a true conflict without touching the tree and keeps the patch artifact", async () => {
+		const first = await childPatch("first", { 10: "edited by first" });
+		const second = await childPatch("second", { 10: "edited by second" });
+		const firstOutcome = await mergeIsolatedChanges({ result: first, repoRoot: repo, mergeMode: "patch" });
+		expect(firstOutcome.changesApplied).toBe(true);
+
+		const [treeBefore, statusBefore, indexBefore] = await Promise.all([
+			readShared(),
+			runGit(repo, ["status", "--porcelain=v1"]),
+			runGit(repo, ["diff", "--cached"]),
+		]);
+
+		const outcome = await mergeIsolatedChanges({ result: second, repoRoot: repo, mergeMode: "patch" });
+
+		expect(outcome.changesApplied).toBe(false);
+		expect(outcome.hadAnyChanges).toBe(false);
+		expect(outcome.summary).toContain("shared.txt");
+		expect(outcome.summary).toContain(second.patchPath as string);
+		expect(outcome.summary).not.toContain("Applied patches: yes");
+		const [treeAfter, statusAfter, indexAfter, artifactExists] = await Promise.all([
+			readShared(),
+			runGit(repo, ["status", "--porcelain=v1"]),
+			runGit(repo, ["diff", "--cached"]),
+			Bun.file(second.patchPath as string).exists(),
+		]);
+		expect(treeAfter).toBe(treeBefore);
+		expect(statusAfter).toBe(statusBefore);
+		expect(indexAfter).toBe(indexBefore);
+		expect(treeAfter).not.toContain("<<<<<<<");
+		expect(artifactExists).toBe(true);
+	});
 });
 
 describe("commitToBranch preserves agent commits", () => {
@@ -1603,5 +1829,37 @@ describe("commitToBranch preserves agent commits", () => {
 			expect(branchDiff).toContain("+WIP header");
 			expect(branchDiff).toContain("+agent-edit");
 		});
+	});
+});
+
+describe("probePatchApplies", () => {
+	/** A repo whose `canApplyPatch` fails with `error`. */
+	function failingRepo(error: Error): VcsGitRepo {
+		return { canApplyPatch: async () => Promise.reject(error) } as unknown as VcsGitRepo;
+	}
+
+	it('reads a native VCS failure as "does not apply"', async () => {
+		const vcsError = Object.assign(new Error("missing preimage blob"), { name: "VcsError", code: "ObjectNotFound" });
+		expect(await probePatchApplies(failingRepo(vcsError), "patch", { threeWay: true })).toBe(false);
+	});
+
+	// Pre-fix the probes swallowed every error as a conflict, so an I/O failure
+	// or corrupt repository surfaced as "patch does not apply".
+	it("propagates a non-VCS error instead of reporting a conflict", async () => {
+		const ioError = new Error("EIO: i/o error, read");
+		await expect(probePatchApplies(failingRepo(ioError), "patch", {})).rejects.toBe(ioError);
+	});
+
+	it("reports the real verdict of a probe against a repository", async () => {
+		const repo = await createGitRepo();
+		await runGit(repo, ["config", "user.email", "test@example.com"]);
+		await runGit(repo, ["config", "user.name", "Test User"]);
+		await Bun.write(path.join(repo, "a.txt"), "one\ntwo\n");
+		await runGit(repo, ["add", "."]);
+		await runGit(repo, ["commit", "-q", "-m", "init"]);
+		const patch = await diffForEdit(repo, "a.txt", ["one", "TWO"]);
+		const git = vcs.requireGit(repo);
+		expect(await probePatchApplies(git, patch, {})).toBe(true);
+		expect(await probePatchApplies(git, patch, { reverse: true })).toBe(false);
 	});
 });
